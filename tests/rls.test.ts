@@ -852,6 +852,296 @@ describe("record_stripe_payment() — atomicity and idempotency (Phase 3)", () =
   });
 });
 
+describe("mark_order_dispatched() / create_internal_order() — the Retool write API (Phase 4)", () => {
+  // Auth model confirmed with the user: Retool holds ONE privileged
+  // (service_role) connection, not per-staff pass-through auth. So the real
+  // gate here isn't "is this caller internal_ops" (that's meaningless for a
+  // service_role call, which carries no app_role claim) -- it's "is this
+  // caller service_role at all", checked explicitly inside the function.
+  let company: { id: string };
+  const staffEmail = uniqueEmail("p4-staff");
+  const customerEmail = uniqueEmail("p4-cust");
+  let staffId: string;
+  let employee: { id: string };
+  let orderId: string;
+
+  beforeAll(async () => {
+    company = await createCompany("Phase4 Dispatch Test Co");
+    const staff = await createAuthUser(staffEmail);
+    const customer = await createAuthUser(customerEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+    await createProfile(customer.id, company.id, customerEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Dispatch Test", email: "dispatch@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const client = await clientAsUser(customerEmail);
+    const { data: orderIdData, error: orderError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (orderError) throw orderError;
+    orderId = orderIdData as string;
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [staffEmail, customerEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a regular authenticated customer cannot call mark_order_dispatched", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { error } = await client.rpc("mark_order_dispatched", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_courier: "DPD",
+      p_tracking_number: "DPD123",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ even a genuine internal_ops user calling with their OWN session (not service_role) is rejected", async () => {
+    // Deliberate: the design is service_role-only, not role-based. A real
+    // internal_ops human logged in normally still isn't service_role.
+    const client = await clientAsUser(staffEmail);
+    const { error } = await client.rpc("mark_order_dispatched", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_courier: "DPD",
+      p_tracking_number: "DPD123",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ service_role call with a non-internal actor_id is rejected by assert_internal_actor", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { data: customerUser } = await client.auth.getUser();
+    const { error } = await adminClient.rpc("mark_order_dispatched", {
+      p_order_id: orderId,
+      p_actor_id: customerUser.user!.id, // a company_admin, not internal staff
+      p_courier: "DPD",
+      p_tracking_number: "DPD123",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ service_role with a valid internal actor dispatches the order, sets outbound_* and fulfilment_log", async () => {
+    const { error } = await adminClient.rpc("mark_order_dispatched", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_courier: "DPD",
+      p_tracking_number: "DPD123456",
+      p_tracking_url: "https://example.com/track/DPD123456",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, outbound_courier, outbound_tracking_number, fulfilment_log")
+      .eq("id", orderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("dispatched");
+    expect(order?.outbound_courier).toBe("DPD");
+    expect(order?.outbound_tracking_number).toBe("DPD123456");
+    expect(Array.isArray(order?.fulfilment_log)).toBe(true);
+    expect((order?.fulfilment_log as unknown[]).length).toBe(1);
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action, actor_id")
+      .eq("target_id", orderId)
+      .eq("action", "order.dispatch");
+    expect(auditRows?.length).toBe(1);
+    expect(auditRows?.[0].actor_id).toBe(staffId);
+  });
+
+  it("✗ dispatching an order that's already dispatched is refused (state guard)", async () => {
+    const { error } = await adminClient.rpc("mark_order_dispatched", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_courier: "DPD",
+      p_tracking_number: "DPD999",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ create_internal_order rejects a non-service_role caller", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { error } = await client.rpc("create_internal_order", {
+      p_company_id: company.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ create_internal_order via service_role creates a source='internal_staff' order", async () => {
+    const { data: newOrderId, error } = await adminClient.rpc("create_internal_order", {
+      p_company_id: company.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("source, created_by, reference")
+      .eq("id", newOrderId as string)
+      .single();
+    expect(order?.source).toBe("internal_staff");
+    expect(order?.created_by).toBe(staffId);
+    expect(order?.reference).toMatch(/^RKP-\d{6}-\d{3,}$/);
+  });
+});
+
+describe("confirm_sent() / confirm_received() — customer-facing (Phase 4)", () => {
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const a1Email = uniqueEmail("p4-conf-a1");
+  const bEmail = uniqueEmail("p4-conf-b1");
+  let employeeA: { id: string };
+  let returnOrderId: string;
+  let shipOrderId: string;
+
+  beforeAll(async () => {
+    companyA = await createCompany("Phase4 Confirm Test Co A");
+    companyB = await createCompany("Phase4 Confirm Test Co B");
+
+    const a1 = await createAuthUser(a1Email);
+    const b1 = await createAuthUser(bEmail);
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Confirm Test", email: "confirm@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: companyA.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(a1Email);
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: (addr as { id: string }).id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+    });
+    if (shipError) throw shipError;
+    shipOrderId = shipId as string;
+
+    // Fixture setup only -- fast-forward both orders to 'dispatched' by
+    // direct admin update rather than exercising mark_order_dispatched
+    // again here (already covered by the describe block above).
+    await adminClient.from("orders").update({ fulfilment_status: "dispatched" }).in("id", [returnOrderId, shipOrderId]);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", companyA.id);
+    for (const email of [a1Email, bEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("✗ cross-tenant: a user in company B cannot confirm_sent on company A's order", async () => {
+    const client = await clientAsUser(bEmail);
+    const { error } = await client.rpc("confirm_sent", { p_order_id: returnOrderId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ confirm_sent refuses a ship_to_new_employee order", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("confirm_sent", { p_order_id: shipOrderId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ confirm_sent on the owning company's return order records actor and timestamp", async () => {
+    const client = await clientAsUser(a1Email);
+    const { data: user } = await client.auth.getUser();
+    const { error } = await client.rpc("confirm_sent", {
+      p_order_id: returnOrderId,
+      p_return_tracking_number: "RM123456",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_sent_at, confirmed_sent_by, return_tracking_number")
+      .eq("id", returnOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("confirmed_sent");
+    expect(order?.confirmed_sent_at).not.toBeNull();
+    expect(order?.confirmed_sent_by).toBe(user.user!.id);
+    expect(order?.return_tracking_number).toBe("RM123456");
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action")
+      .eq("target_id", returnOrderId)
+      .eq("action", "order.confirm_sent");
+    expect(auditRows?.length).toBe(1);
+  });
+
+  it("✗ confirm_received refuses a return order", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("confirm_received", { p_order_id: returnOrderId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ confirm_received on the owning company's ship-to-new-employee order completes it", async () => {
+    const client = await clientAsUser(a1Email);
+    const { data: user } = await client.auth.getUser();
+    const { error } = await client.rpc("confirm_received", { p_order_id: shipOrderId });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at, confirmed_received_by")
+      .eq("id", shipOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    expect(order?.confirmed_received_at).not.toBeNull();
+    expect(order?.confirmed_received_by).toBe(user.user!.id);
+  });
+
+  it("✗ confirming an already-completed order again is refused (state guard)", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("confirm_received", { p_order_id: shipOrderId });
+    expect(error).not.toBeNull();
+  });
+});
+
 describe("accept_invite() is race-safe (Base44 gotcha: atomic claim)", () => {
   it("two concurrent accepts of the same invite grant exactly one user row", async () => {
     const company = await createCompany("Race Test Co");
