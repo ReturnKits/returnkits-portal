@@ -88,6 +88,40 @@ describe("RLS: public.users — the four required directions (architecture §9.3
     expect(error).toBeNull();
     expect(data).toEqual([]);
   });
+
+  it("✓ self-read: a user can read their own row even on a JWT issued before their profile existed", async () => {
+    // Reproduces a real bug: create_company_and_admin() creates the profile,
+    // but the onboarding flow's "do I have a company yet?" check
+    // (select id from users where id = auth.uid()) runs on whatever session
+    // is already live in the browser. Before this fix, users_select relied
+    // entirely on company_id = current_company() -- which reads the
+    // company_id JWT claim -- so a session that authenticated before the
+    // profile existed (claim: null) could never see its own freshly-created
+    // row without an explicit token refresh, sending users back to the
+    // company-creation form in a loop even though their company existed.
+    const email = uniqueEmail("self-read");
+    const user = await createAuthUser(email);
+
+    // Get a client session BEFORE any public.users row exists for this
+    // user -- the custom access token hook has nothing to inject yet, so
+    // this JWT's company_id claim is null, same as noProfileEmail above.
+    const client = await clientAsUser(email);
+
+    // Now create the profile out-of-band (mirrors what
+    // create_company_and_admin does), without the client refreshing its
+    // token or re-authenticating.
+    const company = await createCompany("Self-Read Test Co");
+    await createProfile(user.id, company.id, email, "company_admin");
+
+    try {
+      const { data, error } = await client.from("users").select("id").eq("id", user.id).maybeSingle();
+      expect(error).toBeNull();
+      expect(data?.id).toBe(user.id);
+    } finally {
+      await deleteAuthUserByEmail(email);
+      await adminClient.from("companies").delete().eq("id", company.id);
+    }
+  });
 });
 
 describe("RLS: public.invites — isolation and collaboration", () => {
@@ -259,12 +293,34 @@ describe("RLS: public.addresses — isolation and collaboration", () => {
     expect(data?.company_id).toBe(companyA.id);
   });
 
-  it("✗ cannot insert an address for a different company", async () => {
+  it("✓ set_company_id_from_session trigger: company_id is set server-side even if omitted (Phase 3 bug fix)", async () => {
+    // Fixes "No company on your session yet" — the client no longer needs
+    // to know/send its own company_id at all. Using `as never` because the
+    // generated types still mark company_id required; the DB doesn't.
     const client = await clientAsUser(a2Email);
-    const { error } = await client
+    const { data, error } = await client
       .from("addresses")
-      .insert({ company_id: companyB.id, label: "Sneaky", address_line1: "3 Test Street", city: "London", postcode: "E1 6AN" });
-    expect(error).not.toBeNull();
+      .insert({ label: "No company_id sent", address_line1: "4 Test Street", city: "London", postcode: "E1 6AN" } as never)
+      .select()
+      .single();
+    expect(error).toBeNull();
+    expect(data?.company_id).toBe(companyA.id);
+  });
+
+  it("✓ a client-supplied company_id for a DIFFERENT company is silently overridden, not merely rejected", async () => {
+    // Stronger than the old behaviour (which just made the WITH CHECK
+    // policy reject a mismatched company_id): now there's no value the
+    // client could send that results in a cross-tenant row at all — the
+    // trigger fires before the RLS check ever sees the client's input.
+    const client = await clientAsUser(a2Email);
+    const { data, error } = await client
+      .from("addresses")
+      .insert({ company_id: companyB.id, label: "Sneaky", address_line1: "3 Test Street", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    expect(error).toBeNull();
+    expect(data?.company_id).toBe(companyA.id);
+    expect(data?.company_id).not.toBe(companyB.id);
   });
 });
 
@@ -316,6 +372,39 @@ describe("RLS: public.employees — isolation and collaboration", () => {
     const { data, error } = await client.from("employees").select("*").eq("id", employeeA.id);
     expect(error).toBeNull();
     expect(data).toEqual([]);
+  });
+
+  it("✓ set_company_id_from_session trigger: company_id is set server-side even if omitted (Phase 3 bug fix)", async () => {
+    const client = await clientAsUser(a2Email);
+    const { data, error } = await client
+      .from("employees")
+      .insert({ full_name: "No company_id sent" } as never)
+      .select()
+      .single();
+    expect(error).toBeNull();
+    expect(data?.company_id).toBe(companyA.id);
+  });
+
+  it("✓ a client-supplied company_id for a DIFFERENT company is silently overridden, not merely rejected", async () => {
+    const client = await clientAsUser(a2Email);
+    const { data, error } = await client
+      .from("employees")
+      .insert({ company_id: companyB.id, full_name: "Sneaky" })
+      .select()
+      .single();
+    expect(error).toBeNull();
+    expect(data?.company_id).toBe(companyA.id);
+    expect(data?.company_id).not.toBe(companyB.id);
+  });
+
+  it("✗ the trigger refuses a profile-less user with its own clear error", async () => {
+    const noProfileEmail = uniqueEmail("emp-noprofile");
+    await createAuthUser(noProfileEmail);
+    const client = await clientAsUser(noProfileEmail);
+    const { error } = await client.from("employees").insert({ full_name: "Orphan" } as never);
+    expect(error).not.toBeNull();
+    expect(error?.message).toMatch(/not attached to a company/i);
+    await deleteAuthUserByEmail(noProfileEmail);
   });
 });
 
@@ -451,6 +540,315 @@ describe("RLS: public.orders — isolation, collaboration, and create_order()", 
     const refs = (rows ?? []).map((r) => r.reference);
     expect(refs.length).toBe(2);
     expect(new Set(refs).size).toBe(2);
+  });
+
+  it("✗ a company_admin cannot set their own order's payment_status directly (Phase 3)", async () => {
+    // orders_update_admin_or_internal permits a company_admin to update rows
+    // in their own company -- that policy governs row visibility, not which
+    // columns. Without the trigger, a client could PATCH payment_status to
+    // "paid" without ever paying. This is the trigger added alongside the
+    // invoices table in Phase 3 (enforce_orders_payment_fields_immutable_by_client).
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.from("orders").update({ payment_status: "paid" }).eq("id", orderAId);
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ service_role (the webhook handler's identity) CAN set payment_status", async () => {
+    // adminClient uses the service_role key, same trust level the Stripe
+    // webhook Edge Function runs as -- confirms the trigger only blocks the
+    // client role, not the one path that's actually supposed to write this.
+    const { error } = await adminClient.from("orders").update({ payment_status: "paid" }).eq("id", orderAId);
+    expect(error).toBeNull();
+    // Reset for any later test in this block that assumes 'pending'.
+    await adminClient.from("orders").update({ payment_status: "pending" }).eq("id", orderAId);
+  });
+});
+
+describe("RLS: public.invoices — isolation, collaboration, and client write protection (Phase 3)", () => {
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const a1Email = uniqueEmail("inv-a1");
+  const a2Email = uniqueEmail("inv-a2");
+  const bEmail = uniqueEmail("inv-b1");
+  let employeeA: { id: string };
+  let orderAId: string;
+  let invoiceAId: string;
+
+  beforeAll(async () => {
+    companyA = await createCompany("Invoice Test Co A");
+    companyB = await createCompany("Invoice Test Co B");
+
+    const a1 = await createAuthUser(a1Email);
+    const a2 = await createAuthUser(a2Email);
+    const b1 = await createAuthUser(bEmail);
+
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+    await createProfile(a2.id, companyA.id, a2Email, "company_member");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Pat Payee", email: "pat@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+
+    const client = await clientAsUser(a1Email);
+    const { data: orderId, error: orderError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+    });
+    if (orderError) throw orderError;
+    orderAId = orderId as string;
+
+    // Simulate what the webhook handler does, as service_role: create the
+    // invoice, mark the order paid. Real invoice_number values come from
+    // invoice_number_seq (nextval() inside the webhook handler, never in
+    // tests) -- nothing in the schema ties a specific row's number to the
+    // sequence, only uniqueness, so a fixture-local unique int is enough
+    // here and avoids burning real sequence values on every test run.
+    const invoiceNumber = Date.now() % 2_000_000_000;
+
+    const { data: invoice, error: invoiceError } = await adminClient
+      .from("invoices")
+      .insert({
+        company_id: companyA.id,
+        invoice_number: invoiceNumber,
+        stripe_checkout_session_id: `cs_test_${invoiceNumber}`,
+        subtotal_ex_vat_pence: 6500,
+        vat_pence: 1300,
+        total_inc_vat_pence: 7800,
+      })
+      .select()
+      .single();
+    if (invoiceError) throw invoiceError;
+    invoiceAId = invoice!.id;
+
+    const { error: updateError } = await adminClient
+      .from("orders")
+      .update({ payment_status: "paid", invoice_id: invoiceAId })
+      .eq("id", orderAId);
+    if (updateError) throw updateError;
+  });
+
+  afterAll(async () => {
+    // orders/invoices before users/companies -- same FK ordering constraint
+    // as every other describe block in this file.
+    await adminClient.from("orders").delete().eq("company_id", companyA.id);
+    await adminClient.from("invoices").delete().eq("company_id", companyA.id);
+    for (const email of [a1Email, a2Email, bEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("✓ collaboration: user 2 in company A CAN see the invoice user 1's order generated", async () => {
+    const client = await clientAsUser(a2Email);
+    const { data, error } = await client.from("invoices").select("id, invoice_number").eq("id", invoiceAId);
+    expect(error).toBeNull();
+    expect(data?.length).toBe(1);
+  });
+
+  it("✗ isolation: a user in company B cannot see company A's invoice", async () => {
+    const client = await clientAsUser(bEmail);
+    const { data, error } = await client.from("invoices").select("*").eq("id", invoiceAId);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("✗ a client cannot INSERT an invoice directly — only the webhook handler (service_role) can", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.from("invoices").insert({
+      company_id: companyA.id,
+      invoice_number: 999999,
+      stripe_checkout_session_id: "cs_test_forged",
+      subtotal_ex_vat_pence: 100,
+      vat_pence: 20,
+      total_inc_vat_pence: 120,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("invoice arithmetic: total is always subtotal + VAT (DB constraint, not just app logic)", async () => {
+    const { error } = await adminClient.from("invoices").insert({
+      company_id: companyA.id,
+      invoice_number: 999998,
+      stripe_checkout_session_id: "cs_test_bad_math",
+      subtotal_ex_vat_pence: 6500,
+      vat_pence: 1300,
+      total_inc_vat_pence: 7799, // off by a penny
+    });
+    expect(error).not.toBeNull();
+    await adminClient.from("invoices").delete().eq("invoice_number", 999998);
+  });
+});
+
+describe("record_stripe_payment() — atomicity and idempotency (Phase 3)", () => {
+  // Signature verification itself lives in the Deno webhook Edge Function,
+  // not the database, so it isn't exercised here (the plan's "wrongly-signed
+  // webhook rejected" exit criterion is a manual/curl check against the
+  // deployed function). What IS testable at this layer, and is arguably the
+  // more dangerous half: given a validly-authenticated call, does the write
+  // path behave atomically and idempotently? That's this block.
+  let company: { id: string };
+  const ownerEmail = uniqueEmail("pay-owner");
+  let employee: { id: string };
+  let orderId: string;
+
+  beforeAll(async () => {
+    company = await createCompany("Payment Test Co");
+    const owner = await createAuthUser(ownerEmail);
+    await createProfile(owner.id, company.id, ownerEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Sam Sender", email: "sam@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const client = await clientAsUser(ownerEmail);
+    const { data: orderIdData, error: orderError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (orderError) throw orderError;
+    orderId = orderIdData as string;
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    await adminClient.from("invoices").delete().eq("company_id", company.id);
+    await deleteAuthUserByEmail(ownerEmail);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ an authenticated client cannot call record_stripe_payment directly", async () => {
+    // The advisor caught this project's default EXECUTE-to-authenticated
+    // grant on this exact function the first time it was created (see
+    // 20260807230100_lock_down_record_stripe_payment.sql) -- without that
+    // fix, any signed-in customer could mint their own "paid" invoice.
+    const client = await clientAsUser(ownerEmail);
+    const { error } = await client.rpc("record_stripe_payment", {
+      p_event_id: `evt_forged_${Date.now()}`,
+      p_event_type: "checkout.session.completed",
+      p_checkout_session_id: `cs_forged_${Date.now()}`,
+      p_payment_intent_id: null,
+      p_company_id: company.id,
+      p_order_ids: [orderId],
+      p_subtotal_ex_vat_pence: 4000,
+      p_vat_pence: 800,
+      p_total_inc_vat_pence: 4800,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ service_role: marks the order paid and issues a gapless invoice number", async () => {
+    const eventId = `evt_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    const sessionId = `cs_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+
+    const { data: invoiceId, error } = await adminClient.rpc("record_stripe_payment", {
+      p_event_id: eventId,
+      p_event_type: "checkout.session.completed",
+      p_checkout_session_id: sessionId,
+      p_payment_intent_id: `pi_${sessionId}`,
+      p_company_id: company.id,
+      p_order_ids: [orderId],
+      p_subtotal_ex_vat_pence: 4000,
+      p_vat_pence: 800,
+      p_total_inc_vat_pence: 4800,
+    });
+    expect(error).toBeNull();
+    expect(invoiceId).not.toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("payment_status, invoice_id")
+      .eq("id", orderId)
+      .single();
+    expect(order?.payment_status).toBe("paid");
+    expect(order?.invoice_id).toBe(invoiceId);
+
+    const { data: invoice } = await adminClient
+      .from("invoices")
+      .select("invoice_number, total_inc_vat_pence")
+      .eq("id", invoiceId)
+      .single();
+    expect(invoice?.total_inc_vat_pence).toBe(4800);
+    expect(Number.isInteger(invoice?.invoice_number)).toBe(true);
+  });
+
+  it("✓ replaying the same event id twice changes nothing (exit criterion, architecture §9.7)", async () => {
+    const eventId = `evt_replay_${Date.now()}`;
+    const sessionId = `cs_replay_${Date.now()}`;
+    const args = {
+      p_event_id: eventId,
+      p_event_type: "checkout.session.completed",
+      p_checkout_session_id: sessionId,
+      p_payment_intent_id: `pi_${sessionId}`,
+      p_company_id: company.id,
+      p_order_ids: [orderId],
+      p_subtotal_ex_vat_pence: 4000,
+      p_vat_pence: 800,
+      p_total_inc_vat_pence: 4800,
+    };
+
+    // This order was already marked paid by the previous test, so on a
+    // *first* delivery record_stripe_payment would now correctly refuse it
+    // (order set no longer 'pending') -- but replaying the SAME event id
+    // must short-circuit on the idempotency check before that logic ever
+    // runs, and return null rather than raising.
+    const first = await adminClient.rpc("record_stripe_payment", args);
+    expect(first.error).toBeNull();
+    expect(first.data).toBeNull();
+
+    const { count: invoiceCountBefore } = await adminClient
+      .from("invoices")
+      .select("id", { count: "exact", head: true })
+      .eq("stripe_checkout_session_id", sessionId);
+    expect(invoiceCountBefore).toBe(0);
+
+    const second = await adminClient.rpc("record_stripe_payment", args);
+    expect(second.error).toBeNull();
+    expect(second.data).toBeNull();
+
+    const { count: eventCount } = await adminClient
+      .from("stripe_webhook_events")
+      .select("event_id", { count: "exact", head: true })
+      .eq("event_id", eventId);
+    expect(eventCount).toBe(1);
+  });
+
+  it("✗ refuses to pay an order that's no longer pending, and rolls back the event record with it", async () => {
+    // orderId is already 'paid' from the earlier test. A genuinely new
+    // event trying to pay it again (not a replay -- a fresh event_id) must
+    // be rejected, and critically must not leave a stripe_webhook_events row
+    // behind for it either -- otherwise a legitimate retry with a
+    // *corrected* payload would be silently swallowed as "already
+    // processed" by an event that actually failed.
+    const eventId = `evt_reject_${Date.now()}`;
+    const { error } = await adminClient.rpc("record_stripe_payment", {
+      p_event_id: eventId,
+      p_event_type: "checkout.session.completed",
+      p_checkout_session_id: `cs_reject_${Date.now()}`,
+      p_payment_intent_id: null,
+      p_company_id: company.id,
+      p_order_ids: [orderId],
+      p_subtotal_ex_vat_pence: 4000,
+      p_vat_pence: 800,
+      p_total_inc_vat_pence: 4800,
+    });
+    expect(error).not.toBeNull();
+
+    const { count } = await adminClient
+      .from("stripe_webhook_events")
+      .select("event_id", { count: "exact", head: true })
+      .eq("event_id", eventId);
+    expect(count).toBe(0);
   });
 });
 

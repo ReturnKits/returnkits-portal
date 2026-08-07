@@ -9,7 +9,9 @@ See `CLAUDE.md` for build rules and locked decisions, and `docs/` for the full d
 - `docs/returnkits-getting-started.md` — stack, tooling, setup commands
 - `docs/returnkits-base44-audit.md` — what went wrong in the prototype this rebuild replaces
 
-**Status:** Phase 0 — Foundations.
+**Status:** Phase 2 — schema hand-written and RLS-tested (`companies`, `users`, `invites`, `audit_log`, `roles`, `kit_types`, `reference_counters`, `orders`, `bundles`, `addresses`, `employees`). Lovable screens built (signup, invite acceptance, order form/list/detail, addresses, employee directory).
+
+**This repo holds the schema, migrations, and RLS tests only.** The customer portal UI is built in Lovable and lives in a separate repo, [ReturnKits/returnkit-portal-shell](https://github.com/ReturnKits/returnkit-portal-shell), synced two-way with Lovable. That repo's Supabase client points at the same hosted project as this repo's migrations — schema changes are still made here first, then reviewed, per CLAUDE.md.
 
 ## Quick start
 
