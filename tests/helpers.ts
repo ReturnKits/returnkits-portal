@@ -68,7 +68,6 @@ export async function clientAsUser(email: string): Promise<SupabaseClient> {
   });
 
   const { error: verifyError } = await client.auth.verifyOtp({
-    email,
     token_hash: linkData.properties.hashed_token,
     type: "magiclink",
   });
