@@ -6,6 +6,14 @@
   "scripts": {
     "db:reset": "supabase db reset",
     "db:types": "supabase gen types typescript --local > lib/db/types.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@types/node": "^22.0.0",
+    "dotenv": "^16.4.0",
+    "supabase": "^1.200.0",
+    "vitest": "^2.1.0"
   }
 }
