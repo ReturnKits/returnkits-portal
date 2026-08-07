@@ -1,0 +1,11 @@
+{
+  "name": "returnkits-portal",
+  "private": true,
+  "version": "0.0.0",
+  "description": "ReturnKits customer portal — multi-tenant IT asset recovery / reverse logistics.",
+  "scripts": {
+    "db:reset": "supabase db reset",
+    "db:types": "supabase gen types typescript --local > lib/db/types.ts",
+    "test": "vitest run"
+  }
+}
