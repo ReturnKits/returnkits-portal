@@ -260,7 +260,12 @@ inspector_port = 8083
 # entrypoint = "./functions/MY_FUNCTION_NAME/index.ts"
 
 [analytics]
-enabled = true
+# Disabled for local dev: the bundled logflare 1.4.0 image crash-loops on its
+# own health check (unrelated to this project — a bug in its billing-plan
+# matcher), and vector's docker-log collector needs the Docker daemon
+# exposed over TCP, which Docker Desktop on Windows doesn't do by default.
+# Log aggregation isn't needed for schema/RLS work either way.
+enabled = false
 port = 54327
 # Configure one of the supported backends: `postgres`, `bigquery`.
 backend = "postgres"
