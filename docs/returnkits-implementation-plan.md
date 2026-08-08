@@ -132,6 +132,8 @@ Start DNS and accounts on day one — they have lead time and block Phase 4.
 
 > Labels are still bought **manually in Sendcloud's dashboard**. Two minutes per order, zero build time.
 
+> **`confirm_received` is a known stopgap, not the real answer.** It asks the company admin who placed a ship-to-new-employee order to confirm delivery — but the new joiner is the one who actually receives the kit, and they have no portal account (no guest logins, per the locked decisions). The admin usually has no way to know it arrived. `confirm_sent` (return orders) doesn't have this problem — the person confirming is the one who physically posted the box. Leave `confirm_received` wired up as-is; the real fix is Phase 6's Sendcloud tracking webhooks updating `fulfilment_status` automatically instead of relying on manual confirmation from someone without visibility.
+
 ---
 
 ## Phase 5 — Notifications
