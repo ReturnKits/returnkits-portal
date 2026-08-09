@@ -23,6 +23,7 @@
 
 import Stripe from "npm:stripe@17.5.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { captureError } from "../_shared/sentry.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -56,6 +57,18 @@ type OrderRow = {
 };
 
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (err) {
+    captureError(err, { function: "create-checkout-session" });
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
@@ -108,7 +121,7 @@ Deno.serve(async (req: Request) => {
     .returns<OrderRow[]>();
 
   if (ordersError) {
-    console.error("create-checkout-session: orders query failed", ordersError);
+    captureError(ordersError, { function: "create-checkout-session", step: "orders query" });
     return new Response(JSON.stringify({ error: "Could not look up orders" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -181,7 +194,11 @@ Deno.serve(async (req: Request) => {
     .single();
 
   if (companyError || !company) {
-    console.error("create-checkout-session: company lookup failed", companyError);
+    captureError(companyError ?? new Error("company lookup returned no row"), {
+      function: "create-checkout-session",
+      step: "company lookup",
+      companyId,
+    });
     return new Response(JSON.stringify({ error: "Could not look up company" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -221,4 +238,4 @@ Deno.serve(async (req: Request) => {
     status: 200,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
-});
+}

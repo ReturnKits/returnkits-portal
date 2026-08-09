@@ -1752,3 +1752,273 @@ describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown
     await deleteAuthUserByEmail(shipEmail);
   });
 });
+
+// The blocks below close gaps found in a Launch Gate review: real,
+// tenant-scoped RLS policies existed for these tables from Phase 2/3
+// onward, but no test ever exercised either direction on them -- they were
+// only ever touched via adminClient as fixture setup/teardown for other
+// describe blocks, never as the thing under test.
+
+describe("RLS: public.companies — isolation, collaboration, and admin-only update (gap closed post-Phase-5)", () => {
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const adminEmail = uniqueEmail("co-admin");
+  const memberEmail = uniqueEmail("co-member");
+  const bEmail = uniqueEmail("co-b");
+
+  beforeAll(async () => {
+    companyA = await createCompany("Company RLS Test Co A");
+    companyB = await createCompany("Company RLS Test Co B");
+
+    const admin = await createAuthUser(adminEmail);
+    const member = await createAuthUser(memberEmail);
+    const b1 = await createAuthUser(bEmail);
+
+    await createProfile(admin.id, companyA.id, adminEmail, "company_admin");
+    await createProfile(member.id, companyA.id, memberEmail, "company_member");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+  });
+
+  afterAll(async () => {
+    for (const email of [adminEmail, memberEmail, bEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("✓ collaboration: a company_member can read their own company's row", async () => {
+    const client = await clientAsUser(memberEmail);
+    const { data, error } = await client.from("companies").select("id, name").eq("id", companyA.id);
+    expect(error).toBeNull();
+    expect(data?.length).toBe(1);
+  });
+
+  it("✗ isolation: a user in company A cannot read company B's row", async () => {
+    const client = await clientAsUser(adminEmail);
+    const { data, error } = await client.from("companies").select("*").eq("id", companyB.id);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("✓ company_admin can update their own company (e.g. billing_email)", async () => {
+    const client = await clientAsUser(adminEmail);
+    const { error } = await client
+      .from("companies")
+      .update({ billing_email: "billing@company-a-test.invalid" })
+      .eq("id", companyA.id);
+    expect(error).toBeNull();
+    const { data } = await adminClient.from("companies").select("billing_email").eq("id", companyA.id).single();
+    expect(data?.billing_email).toBe("billing@company-a-test.invalid");
+  });
+
+  it("✗ a company_member (not admin) cannot update their own company", async () => {
+    const client = await clientAsUser(memberEmail);
+    const { error, count } = await client
+      .from("companies")
+      .update({ billing_email: "should-not-land@company-a-test.invalid" })
+      .eq("id", companyA.id)
+      .select("id", { count: "exact" });
+    // RLS silently filters the row out of the UPDATE's WHERE match rather
+    // than erroring -- zero rows affected is the assertion, same shape as
+    // the client-supplied-company_id-override tests elsewhere in this file.
+    expect(error).toBeNull();
+    expect(count).toBe(0);
+  });
+
+  it("✗ a user in company B cannot update company A's row", async () => {
+    const client = await clientAsUser(bEmail);
+    const { error, count } = await client
+      .from("companies")
+      .update({ billing_email: "cross-tenant@company-a-test.invalid" })
+      .eq("id", companyA.id)
+      .select("id", { count: "exact" });
+    expect(error).toBeNull();
+    expect(count).toBe(0);
+  });
+});
+
+describe("RLS: public.bundles — isolation and collaboration via create_bundle() (gap closed post-Phase-5)", () => {
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const a1Email = uniqueEmail("bnd-a1");
+  const a2Email = uniqueEmail("bnd-a2");
+  const bEmail = uniqueEmail("bnd-b1");
+  let bundleAId: string;
+
+  beforeAll(async () => {
+    companyA = await createCompany("Bundle RLS Test Co A");
+    companyB = await createCompany("Bundle RLS Test Co B");
+
+    const a1 = await createAuthUser(a1Email);
+    const a2 = await createAuthUser(a2Email);
+    const b1 = await createAuthUser(bEmail);
+
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+    await createProfile(a2.id, companyA.id, a2Email, "company_member");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+
+    const client = await clientAsUser(a1Email);
+    const { data: bundleId, error } = await client.rpc("create_bundle");
+    if (error) throw error;
+    bundleAId = bundleId as string;
+  });
+
+  afterAll(async () => {
+    await adminClient.from("bundles").delete().eq("id", bundleAId);
+    for (const email of [a1Email, a2Email, bEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("issues a well-formed bundle reference (BND-YYMMDD-NNN)", async () => {
+    const { data } = await adminClient.from("bundles").select("reference").eq("id", bundleAId).single();
+    expect(data?.reference).toMatch(/^BND-\d{6}-\d{3,}$/);
+  });
+
+  it("✓ collaboration: user 2 in company A CAN see the bundle user 1 created", async () => {
+    const client = await clientAsUser(a2Email);
+    const { data, error } = await client.from("bundles").select("id").eq("id", bundleAId);
+    expect(error).toBeNull();
+    expect(data?.length).toBe(1);
+  });
+
+  it("✗ isolation: a user in company B cannot see company A's bundle", async () => {
+    const client = await clientAsUser(bEmail);
+    const { data, error } = await client.from("bundles").select("*").eq("id", bundleAId);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("✗ create_bundle refuses a profile-less user, same as create_order", async () => {
+    const noProfileEmail = uniqueEmail("bnd-noprofile");
+    await createAuthUser(noProfileEmail);
+    const client = await clientAsUser(noProfileEmail);
+    const { error } = await client.rpc("create_bundle");
+    expect(error).not.toBeNull();
+    await deleteAuthUserByEmail(noProfileEmail);
+  });
+});
+
+describe("RLS: public.audit_log — internal-staff-only, no customer visibility (gap closed post-Phase-5)", () => {
+  let company: { id: string };
+  const adminEmail = uniqueEmail("aud-admin");
+  const internalEmail = uniqueEmail("aud-staff");
+  let auditRowId: string;
+
+  beforeAll(async () => {
+    company = await createCompany("Audit Log RLS Test Co");
+    const admin = await createAuthUser(adminEmail);
+    const staff = await createAuthUser(internalEmail);
+    await createProfile(admin.id, company.id, adminEmail, "company_admin");
+    await createProfile(staff.id, null, internalEmail, "internal_ops");
+
+    const { data, error } = await adminClient
+      .from("audit_log")
+      .insert({
+        actor_id: admin.id,
+        action: "test.audit_log_rls_probe",
+        target_table: "companies",
+        target_id: company.id,
+        before: null,
+        after: { probe: true },
+      })
+      .select("id")
+      .single();
+    if (error) throw error;
+    auditRowId = data!.id as string;
+  });
+
+  afterAll(async () => {
+    await adminClient.from("audit_log").delete().eq("id", auditRowId);
+    await deleteAuthUserByEmail(adminEmail);
+    await deleteAuthUserByEmail(internalEmail);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a company_admin (customer, not staff) reads zero audit_log rows, even for their own company", async () => {
+    const client = await clientAsUser(adminEmail);
+    const { data, error } = await client.from("audit_log").select("*").eq("id", auditRowId);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("✓ internal_ops can read audit_log", async () => {
+    const client = await clientAsUser(internalEmail);
+    const { data, error } = await client.from("audit_log").select("id").eq("id", auditRowId);
+    expect(error).toBeNull();
+    expect(data?.length).toBe(1);
+  });
+
+  it("✗ a company_admin cannot insert audit_log rows directly", async () => {
+    const client = await clientAsUser(adminEmail);
+    const { error } = await client.from("audit_log").insert({
+      actor_id: null,
+      action: "test.forged",
+      target_table: "companies",
+      target_id: company.id,
+      before: null,
+      after: {},
+    });
+    expect(error).not.toBeNull();
+  });
+});
+
+describe("RLS: internal-only tables default-deny for every client role (gap closed post-Phase-5)", () => {
+  // reference_counters and stripe_webhook_events predate the Phase 5
+  // suppressed_recipients/resend_webhook_events pattern (RLS enabled, zero
+  // policies -- service_role bypasses RLS entirely, every other role gets
+  // nothing) but never got the equivalent "prove the default-deny actually
+  // holds" test those two got. Closing that gap here rather than
+  // retro-fitting it into the Phase 2/3 describe blocks above.
+
+  it("✗ authenticated clients cannot read reference_counters", async () => {
+    const email = uniqueEmail("refcounter-deny");
+    const company = await createCompany("Reference Counter Deny Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+    const client = await clientAsUser(email);
+
+    const { data, error } = await client.from("reference_counters").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ authenticated clients cannot read stripe_webhook_events", async () => {
+    const email = uniqueEmail("stripeevt-deny");
+    const company = await createCompany("Stripe Webhook Deny Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+    const client = await clientAsUser(email);
+
+    const { data, error } = await client.from("stripe_webhook_events").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ authenticated clients cannot write kit_types (world-readable pricing catalogue must stay read-only)", async () => {
+    const email = uniqueEmail("kittypes-deny");
+    const company = await createCompany("Kit Types Deny Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+    const client = await clientAsUser(email);
+
+    const { error } = await client.from("kit_types").update({ price_ex_vat_pence: 1 }).eq("id", "laptop");
+    expect(error).not.toBeNull();
+
+    // Confirm the world-readable side still works -- this table SHOULD be
+    // selectable by everyone, only writes should be blocked.
+    const { data: readBack, error: readError } = await client.from("kit_types").select("id").eq("id", "laptop");
+    expect(readError).toBeNull();
+    expect(readBack?.length).toBe(1);
+
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+});

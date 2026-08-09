@@ -29,6 +29,7 @@
 
 import Stripe from "npm:stripe@17.5.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { captureError } from "../_shared/sentry.ts";
 
 const stripeSecretKey = Deno.env.get("STRIPE_SECRET_KEY");
 const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
@@ -57,6 +58,18 @@ const stripe = new Stripe(stripeSecretKey ?? "", {
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (err) {
+    captureError(err, { function: "stripe-webhook" });
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
@@ -146,7 +159,11 @@ Deno.serve(async (req: Request) => {
   });
 
   if (error) {
-    console.error("stripe-webhook: record_stripe_payment failed", { sessionId: session.id, error });
+    captureError(new Error(`record_stripe_payment failed: ${error.message}`), {
+      function: "stripe-webhook",
+      sessionId: session.id,
+      eventId: event.id,
+    });
     // Non-2xx tells Stripe to retry — correct for a genuine failure (e.g.
     // the order set no longer matches). record_stripe_payment is a single
     // transaction, so nothing was left half-written.
@@ -160,4 +177,4 @@ Deno.serve(async (req: Request) => {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-});
+}

@@ -31,6 +31,7 @@
 // Resend doesn't send a Supabase JWT, it sends its own Svix signature.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { captureError } from "../_shared/sentry.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -100,6 +101,18 @@ async function verifySvixSignature(params: {
 // ---- Handler ---------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (err) {
+    captureError(err, { function: "resend-webhook" });
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
@@ -118,7 +131,9 @@ Deno.serve(async (req: Request) => {
 
   const { data: secret, error: secretError } = await supabase.rpc("get_resend_webhook_secret");
   if (secretError || !secret) {
-    console.error("resend-webhook: signing secret not available in Vault", secretError);
+    captureError(secretError ?? new Error("resend-webhook: signing secret not available in Vault"), {
+      function: "resend-webhook",
+    });
     // 500, not 200 -- we cannot verify this request at all, so we must not
     // silently accept it. Resend retries with backoff; once the secret is
     // set this starts working with no redeploy needed.
@@ -155,7 +170,7 @@ Deno.serve(async (req: Request) => {
     if (insertError.code === "23505") {
       return new Response(JSON.stringify({ received: true, deduped: true }), { status: 200 });
     }
-    console.error("resend-webhook: failed to record event", insertError);
+    captureError(insertError, { function: "resend-webhook", svixId, eventType });
     return new Response("Failed to record event", { status: 500 });
   }
 
@@ -204,4 +219,4 @@ Deno.serve(async (req: Request) => {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-});
+}

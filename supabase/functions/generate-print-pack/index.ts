@@ -24,6 +24,7 @@
 
 import { PDFDocument, StandardFonts, rgb } from "npm:pdf-lib@1.17.1";
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { captureError } from "../_shared/sentry.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -41,6 +42,18 @@ function formatAddress(parts: Array<string | null | undefined>): string[] {
 }
 
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (err) {
+    captureError(err, { function: "generate-print-pack" });
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405 });
   }
@@ -192,7 +205,7 @@ Deno.serve(async (req: Request) => {
     .upload(path, pdfBytes, { contentType: "application/pdf", upsert: true });
 
   if (uploadError) {
-    console.error("generate-print-pack: upload failed", uploadError);
+    captureError(uploadError, { function: "generate-print-pack", step: "storage upload", orderId });
     return new Response(JSON.stringify({ error: "Could not store the Print Pack" }), { status: 500 });
   }
 
@@ -216,7 +229,11 @@ Deno.serve(async (req: Request) => {
     .createSignedUrl(path, SIGNED_URL_TTL_SECONDS);
 
   if (signError || !signed) {
-    console.error("generate-print-pack: signing failed", signError);
+    captureError(signError ?? new Error("createSignedUrl returned no data"), {
+      function: "generate-print-pack",
+      step: "sign url",
+      orderId,
+    });
     return new Response(JSON.stringify({ error: "Print Pack stored but the signed URL could not be created" }), {
       status: 500,
     });
@@ -226,4 +243,4 @@ Deno.serve(async (req: Request) => {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-});
+}

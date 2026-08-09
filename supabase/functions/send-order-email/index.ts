@@ -44,6 +44,7 @@
 // once the cron job (Phase 5, later) is built.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { captureError } from "../_shared/sentry.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -267,6 +268,18 @@ function buildCheckinReceivedEmail(props: { companyName: string; reference: stri
 // ---- Handler --------------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (err) {
+    captureError(err, { function: "send-order-email" });
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response(JSON.stringify({ error: "Method not allowed" }), { status: 405 });
   }
@@ -495,6 +508,11 @@ Deno.serve(async (req: Request) => {
       status: "failed",
       error_message: JSON.stringify(resendBody).slice(0, 1000),
     });
+    captureError(new Error(`Resend send failed: ${JSON.stringify(resendBody).slice(0, 500)}`), {
+      function: "send-order-email",
+      orderId: o.id,
+      type,
+    });
     return new Response(JSON.stringify({ error: "Resend send failed", detail: resendBody }), { status: 502 });
   }
 
@@ -514,4 +532,4 @@ Deno.serve(async (req: Request) => {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-});
+}

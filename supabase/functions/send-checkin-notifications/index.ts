@@ -25,6 +25,7 @@
 // via net.http_post reading the key from Vault (see trigger_checkin_cron).
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
+import { captureError } from "../_shared/sentry.ts";
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -36,6 +37,18 @@ if (!supabaseUrl || !serviceRoleKey) {
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
 Deno.serve(async (req: Request) => {
+  try {
+    return await handleRequest(req);
+  } catch (err) {
+    captureError(err, { function: "send-checkin-notifications" });
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});
+
+async function handleRequest(req: Request): Promise<Response> {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
@@ -52,7 +65,7 @@ Deno.serve(async (req: Request) => {
 
   const { data: candidates, error } = await supabase.rpc("orders_needing_checkin");
   if (error) {
-    console.error("send-checkin-notifications: orders_needing_checkin failed", error);
+    captureError(error, { function: "send-checkin-notifications", step: "orders_needing_checkin" });
     return new Response(JSON.stringify({ error: error.message }), { status: 500 });
   }
 
@@ -71,14 +84,20 @@ Deno.serve(async (req: Request) => {
       });
       results.push({ orderId: row.order_id, type: row.checkin_type, ok: resp.ok });
       if (!resp.ok) {
-        console.error("send-checkin-notifications: send-order-email failed", {
+        captureError(new Error(`send-order-email returned ${resp.status} for check-in`), {
+          function: "send-checkin-notifications",
           orderId: row.order_id,
           type: row.checkin_type,
           status: resp.status,
         });
       }
     } catch (err) {
-      console.error("send-checkin-notifications: fetch to send-order-email threw", err);
+      captureError(err, {
+        function: "send-checkin-notifications",
+        orderId: row.order_id,
+        type: row.checkin_type,
+        step: "fetch send-order-email",
+      });
       results.push({ orderId: row.order_id, type: row.checkin_type, ok: false });
     }
   }
@@ -87,4 +106,4 @@ Deno.serve(async (req: Request) => {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
-});
+}
