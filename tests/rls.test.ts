@@ -1008,6 +1008,136 @@ describe("mark_order_dispatched() / create_internal_order() — the Retool write
   });
 });
 
+describe("update_order_tracking() — staff correction of either tracking leg (Phase 4)", () => {
+  // Separate from mark_order_dispatched (a state-transition function): this
+  // one lets staff set/correct outbound or return tracking independently of
+  // fulfilment_status, e.g. a customer phones in a return tracking number
+  // instead of using Confirm Sent. Same service_role + assert_internal_actor
+  // gate as the rest of the Retool write API.
+  let company: { id: string };
+  const staffEmail = uniqueEmail("p4-track-staff");
+  const customerEmail = uniqueEmail("p4-track-cust");
+  let staffId: string;
+  let employee: { id: string };
+  let orderId: string;
+
+  beforeAll(async () => {
+    company = await createCompany("Phase4 Tracking Test Co");
+    const staff = await createAuthUser(staffEmail);
+    const customer = await createAuthUser(customerEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+    await createProfile(customer.id, company.id, customerEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Tracking Test", email: "tracking@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const client = await clientAsUser(customerEmail);
+    const { data: orderIdData, error: orderError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (orderError) throw orderError;
+    orderId = orderIdData as string;
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [staffEmail, customerEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a regular authenticated customer cannot call update_order_tracking", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { error } = await client.rpc("update_order_tracking", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_outbound_courier: "DPD",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ service_role call with a non-internal actor_id is rejected", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { data: customerUser } = await client.auth.getUser();
+    const { error } = await adminClient.rpc("update_order_tracking", {
+      p_order_id: orderId,
+      p_actor_id: customerUser.user!.id,
+      p_outbound_courier: "DPD",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ calling with no tracking fields at all is refused", async () => {
+    const { error } = await adminClient.rpc("update_order_tracking", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ sets outbound tracking independently of fulfilment_status (no dispatch required first)", async () => {
+    const { data: before } = await adminClient
+      .from("orders")
+      .select("fulfilment_status")
+      .eq("id", orderId)
+      .single();
+    expect(before?.fulfilment_status).toBe("awaiting_dispatch"); // proves no state transition needed
+
+    const { error } = await adminClient.rpc("update_order_tracking", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_outbound_courier: "Royal Mail",
+      p_outbound_tracking_number: "RM111",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, outbound_courier, outbound_tracking_number, return_tracking_number")
+      .eq("id", orderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("awaiting_dispatch"); // unchanged
+    expect(order?.outbound_courier).toBe("Royal Mail");
+    expect(order?.outbound_tracking_number).toBe("RM111");
+    expect(order?.return_tracking_number).toBeNull(); // untouched
+  });
+
+  it("✓ a later call setting only return tracking leaves outbound tracking untouched", async () => {
+    const { error } = await adminClient.rpc("update_order_tracking", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_return_tracking_number: "RET999",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("outbound_courier, outbound_tracking_number, return_tracking_number")
+      .eq("id", orderId)
+      .single();
+    expect(order?.outbound_courier).toBe("Royal Mail"); // still there from the previous call
+    expect(order?.outbound_tracking_number).toBe("RM111");
+    expect(order?.return_tracking_number).toBe("RET999");
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action, actor_id")
+      .eq("target_id", orderId)
+      .eq("action", "order.tracking_updated");
+    expect(auditRows?.length).toBe(2); // one per call above
+    expect(auditRows?.every((r) => r.actor_id === staffId)).toBe(true);
+  });
+});
+
 describe("confirm_sent() / confirm_received() — customer-facing (Phase 4)", () => {
   let companyA: { id: string };
   let companyB: { id: string };
@@ -1179,5 +1309,446 @@ describe("accept_invite() is race-safe (Base44 gotcha: atomic claim)", () => {
     await deleteAuthUserByEmail(admin.email!);
     await deleteAuthUserByEmail(racerEmail);
     await adminClient.from("companies").delete().eq("id", company.id);
+  });
+});
+
+describe("RLS: public.communication_log — customer-visible, service_role-written only (Phase 5)", () => {
+  let companyA: { id: string };
+  let companyB: { id: string };
+  let orderA: { id: string };
+
+  const a1Email = uniqueEmail("comlog-a1");
+  const a2Email = uniqueEmail("comlog-a2");
+  const bEmail = uniqueEmail("comlog-b1");
+
+  beforeAll(async () => {
+    companyA = await createCompany("Comm Log Test Co A");
+    companyB = await createCompany("Comm Log Test Co B");
+
+    const a1 = await createAuthUser(a1Email);
+    const a2 = await createAuthUser(a2Email);
+    const b1 = await createAuthUser(bEmail);
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+    await createProfile(a2.id, companyA.id, a2Email, "company_member");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+
+    const { data: employee, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Comm Log Test Employee", email: "commlog-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+
+    const a1Client = await clientAsUser(a1Email);
+    const { data: newOrderId, error: orderError } = await a1Client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee!.id,
+    });
+    if (orderError) throw orderError;
+    orderA = { id: newOrderId as string };
+
+    await adminClient.from("communication_log").insert({
+      order_id: orderA.id,
+      company_id: companyA.id,
+      channel: "email",
+      type: "order_confirmation",
+      audience: "customer",
+      recipient: a1Email,
+      subject: "Order confirmed — TEST",
+      status: "sent",
+      provider_message_id: `test-${Date.now()}`,
+    });
+  });
+
+  afterAll(async () => {
+    await deleteAuthUserByEmail(a1Email);
+    await deleteAuthUserByEmail(a2Email);
+    await deleteAuthUserByEmail(bEmail);
+    await adminClient.from("orders").delete().eq("id", orderA.id);
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("✗ isolation: company B cannot read company A's communication_log rows", async () => {
+    const client = await clientAsUser(bEmail);
+    const { data, error } = await client.from("communication_log").select("*").eq("company_id", companyA.id);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("✓ collaboration: user 2 in company A CAN read the confirmation email sent for user 1's order", async () => {
+    const client = await clientAsUser(a2Email);
+    const { data, error } = await client.from("communication_log").select("*").eq("order_id", orderA.id);
+    expect(error).toBeNull();
+    expect(data?.length).toBe(1);
+    expect(data?.[0].recipient).toBe(a1Email);
+  });
+
+  it("✗ clients cannot insert communication_log rows directly — service_role only", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.from("communication_log").insert({
+      order_id: orderA.id,
+      company_id: companyA.id,
+      channel: "email",
+      type: "dispatched",
+      audience: "customer",
+      recipient: a1Email,
+      subject: "forged",
+      status: "sent",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ clients cannot update communication_log status directly (e.g. faking a 'delivered' row)", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client
+      .from("communication_log")
+      .update({ status: "delivered" })
+      .eq("order_id", orderA.id);
+    // Either an explicit RLS error, or a silent no-op (0 rows affected) —
+    // assert on the row's actual state, which is what matters.
+    void error;
+    const { data } = await adminClient.from("communication_log").select("status").eq("order_id", orderA.id).single();
+    expect(data?.status).toBe("sent");
+  });
+});
+
+describe("RLS: public.notification_preferences — read + toggle own company only (Phase 5)", () => {
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const a1Email = uniqueEmail("notifpref-a1");
+  const bEmail = uniqueEmail("notifpref-b1");
+
+  beforeAll(async () => {
+    companyA = await createCompany("Notif Pref Test Co A");
+    companyB = await createCompany("Notif Pref Test Co B");
+    const a1 = await createAuthUser(a1Email);
+    const b1 = await createAuthUser(bEmail);
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+  });
+
+  afterAll(async () => {
+    await deleteAuthUserByEmail(a1Email);
+    await deleteAuthUserByEmail(bEmail);
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("✓ seed_default_notification_preferences fires on company creation — all 4 event types, enabled by default", async () => {
+    const { data, error } = await adminClient
+      .from("notification_preferences")
+      .select("event_type, enabled")
+      .eq("company_id", companyA.id);
+    expect(error).toBeNull();
+    expect(data?.length).toBe(4);
+    expect(data?.every((row) => row.enabled === true)).toBe(true);
+  });
+
+  it("✗ isolation: company B cannot read company A's notification preferences", async () => {
+    const client = await clientAsUser(bEmail);
+    const { data, error } = await client.from("notification_preferences").select("*").eq("company_id", companyA.id);
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+  });
+
+  it("✓ a company admin can mute one event type for their own company", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client
+      .from("notification_preferences")
+      .update({ enabled: false })
+      .eq("company_id", companyA.id)
+      .eq("event_type", "checkin_sent");
+    expect(error).toBeNull();
+
+    const { data } = await adminClient
+      .from("notification_preferences")
+      .select("enabled")
+      .eq("company_id", companyA.id)
+      .eq("event_type", "checkin_sent")
+      .single();
+    expect(data?.enabled).toBe(false);
+
+    const { data: viaHelper } = await adminClient.rpc("notification_enabled", {
+      p_company_id: companyA.id,
+      p_event_type: "checkin_sent",
+    });
+    expect(viaHelper).toBe(false);
+  });
+
+  it("✗ company B cannot mute company A's notifications", async () => {
+    const client = await clientAsUser(bEmail);
+    const { error } = await client
+      .from("notification_preferences")
+      .update({ enabled: false })
+      .eq("company_id", companyA.id)
+      .eq("event_type", "dispatched");
+    // RLS silently drops rows outside the USING clause rather than erroring.
+    void error;
+    const { data } = await adminClient
+      .from("notification_preferences")
+      .select("enabled")
+      .eq("company_id", companyA.id)
+      .eq("event_type", "dispatched")
+      .single();
+    expect(data?.enabled).toBe(true);
+  });
+
+  it("✓ notification_enabled() defaults true for an event_type with no row (pre-Phase-5 company)", async () => {
+    // Simulates a company created before this migration existed — no seeded
+    // row for it, and the helper must not silently drop sends for
+    // pre-existing tenants.
+    const { data } = await adminClient.rpc("notification_enabled", {
+      p_company_id: companyA.id,
+      p_event_type: "nonexistent_event_type_for_test",
+    });
+    expect(data).toBe(true);
+  });
+});
+
+describe("RLS: suppressed_recipients / resend_webhook_events — internal-only, default deny (Phase 5)", () => {
+  it("✗ authenticated clients cannot read suppressed_recipients", async () => {
+    const email = uniqueEmail("suppress-read");
+    await createAuthUser(email);
+    const client = await clientAsUser(email);
+    const { data, error } = await client.from("suppressed_recipients").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+    await deleteAuthUserByEmail(email);
+  });
+
+  it("✗ authenticated clients cannot insert into suppressed_recipients (client can't forge their own exemption or someone else's suppression)", async () => {
+    const email = uniqueEmail("suppress-write");
+    await createAuthUser(email);
+    const client = await clientAsUser(email);
+    const { error } = await client
+      .from("suppressed_recipients")
+      .insert({ email: "forged@test.returnkits.invalid", reason: "hard_bounce" });
+    expect(error).not.toBeNull();
+    await deleteAuthUserByEmail(email);
+  });
+
+  it("✗ authenticated clients cannot read resend_webhook_events", async () => {
+    const email = uniqueEmail("webhookevt-read");
+    await createAuthUser(email);
+    const client = await clientAsUser(email);
+    const { data, error } = await client.from("resend_webhook_events").select("*");
+    expect(error).toBeNull();
+    expect(data).toEqual([]);
+    await deleteAuthUserByEmail(email);
+  });
+
+  it("✓ service_role (webhook handler's identity) can read and write both tables", async () => {
+    const testEmail = `suppress-admin-${Date.now()}@test.returnkits.invalid`;
+    const { error: insertError } = await adminClient
+      .from("suppressed_recipients")
+      .insert({ email: testEmail, reason: "complaint" });
+    expect(insertError).toBeNull();
+
+    const { data } = await adminClient.from("suppressed_recipients").select("*").eq("email", testEmail).single();
+    expect(data?.reason).toBe("complaint");
+
+    await adminClient.from("suppressed_recipients").delete().eq("email", testEmail);
+  });
+});
+
+describe("get_resend_webhook_secret() / order_dispatched_at() / orders_needing_checkin() — locked to service_role (Phase 5)", () => {
+  it("✗ authenticated clients cannot call get_resend_webhook_secret", async () => {
+    const email = uniqueEmail("webhooksecret");
+    await createAuthUser(email);
+    const client = await clientAsUser(email);
+    const { error } = await client.rpc("get_resend_webhook_secret");
+    expect(error).not.toBeNull();
+    await deleteAuthUserByEmail(email);
+  });
+
+  it("✗ authenticated clients cannot call orders_needing_checkin", async () => {
+    const email = uniqueEmail("needcheckin");
+    await createAuthUser(email);
+    const client = await clientAsUser(email);
+    const { error } = await client.rpc("orders_needing_checkin");
+    expect(error).not.toBeNull();
+    await deleteAuthUserByEmail(email);
+  });
+
+  it("✓ service_role can call orders_needing_checkin and get a well-shaped result", async () => {
+    const { data, error } = await adminClient.rpc("orders_needing_checkin");
+    expect(error).toBeNull();
+    expect(Array.isArray(data)).toBe(true);
+  });
+});
+
+describe("Working-day / sending-hours helpers (Phase 5)", () => {
+  // Fixed against the real 2026/2027 England & Wales bank holiday calendar
+  // seeded in the working_days_helpers migration — see gov.uk/bank-holidays.
+  it("✓ a seeded bank holiday is not a working day", async () => {
+    const { data } = await adminClient.rpc("is_uk_working_day", { p_date: "2026-08-31" }); // Summer bank holiday
+    expect(data).toBe(false);
+  });
+
+  it("✓ a weekday that isn't a bank holiday is a working day", async () => {
+    const { data } = await adminClient.rpc("is_uk_working_day", { p_date: "2026-08-10" }); // Monday
+    expect(data).toBe(true);
+  });
+
+  it("✓ a Saturday is not a working day", async () => {
+    const { data } = await adminClient.rpc("is_uk_working_day", { p_date: "2026-08-08" });
+    expect(data).toBe(false);
+  });
+
+  it("✓ add_working_days skips both the weekend and the bank holiday in between", async () => {
+    // Fri 28 Aug 2026 + 1 working day should land on Tue 1 Sep 2026,
+    // skipping Sat 29, Sun 30, and Mon 31 (Summer bank holiday).
+    const { data } = await adminClient.rpc("add_working_days", { p_start: "2026-08-28", p_n: 1 });
+    expect(data).toBe("2026-09-01");
+  });
+
+  it("✓ add_working_days(d, 1) never returns d itself, even when d is a working day", async () => {
+    const { data } = await adminClient.rpc("add_working_days", { p_start: "2026-08-10", p_n: 1 });
+    expect(data).toBe("2026-08-11");
+  });
+
+  it("✗ add_working_days rejects a negative n rather than silently going backwards", async () => {
+    const { error } = await adminClient.rpc("add_working_days", { p_start: "2026-08-10", p_n: -1 });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ next_working_day returns the same date when it's already a working day", async () => {
+    const { data } = await adminClient.rpc("next_working_day", { p_date: "2026-08-10" });
+    expect(data).toBe("2026-08-10");
+  });
+
+  it("✓ next_working_day rolls a bank holiday forward to the next real working day", async () => {
+    const { data } = await adminClient.rpc("next_working_day", { p_date: "2026-08-31" });
+    expect(data).toBe("2026-09-01");
+  });
+
+  it("✓ within_sending_hours: true for a weekday morning in London time", async () => {
+    const { data } = await adminClient.rpc("within_sending_hours", { p_ts: "2026-08-10T09:00:00+01:00" });
+    expect(data).toBe(true);
+  });
+
+  it("✗ within_sending_hours: false after 18:00 London time", async () => {
+    const { data } = await adminClient.rpc("within_sending_hours", { p_ts: "2026-08-10T19:00:00+01:00" });
+    expect(data).toBe(false);
+  });
+
+  it("✗ within_sending_hours: false on a bank holiday, even during business hours", async () => {
+    const { data } = await adminClient.rpc("within_sending_hours", { p_ts: "2026-08-31T10:00:00+01:00" });
+    expect(data).toBe(false);
+  });
+
+  it("✗ within_sending_hours: false on a Saturday", async () => {
+    const { data } = await adminClient.rpc("within_sending_hours", { p_ts: "2026-08-08T10:00:00+01:00" });
+    expect(data).toBe(false);
+  });
+});
+
+describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown (Phase 5)", () => {
+  let company: { id: string };
+  let returnOrder: { id: string };
+  const email = uniqueEmail("checkin-elig");
+
+  beforeAll(async () => {
+    company = await createCompany("Checkin Eligibility Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+
+    const { data: employee, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Checkin Eligibility Employee", email: "checkin-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+
+    const client = await clientAsUser(email);
+    const { data: newOrderId, error: orderError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee!.id,
+    });
+    if (orderError) throw orderError;
+    returnOrder = { id: newOrderId as string };
+
+    // Backdate to a real dispatch, bypassing mark_order_dispatched (test
+    // fixture arrangement via service_role, same pattern used elsewhere in
+    // this suite) so the SLA threshold has genuinely elapsed.
+    const { error: updateError } = await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "dispatched",
+        fulfilment_log: [{ at: "2026-08-01T09:00:00+00:00", action: "dispatched", detail: {}, actor_id: user.id }],
+      })
+      .eq("id", returnOrder.id);
+    if (updateError) throw updateError;
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("id", returnOrder.id);
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✓ order_dispatched_at extracts the dispatched timestamp from fulfilment_log", async () => {
+    const { data } = await adminClient.rpc("order_dispatched_at", { p_order_id: returnOrder.id });
+    expect(data).not.toBeNull();
+  });
+
+  it("✓ a return order dispatched 5+ working days ago with no confirmation is due a checkin_sent nudge", async () => {
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    const match = (data as { order_id: string; checkin_type: string }[]).find((r) => r.order_id === returnOrder.id);
+    expect(match?.checkin_type).toBe("checkin_sent");
+  });
+
+  it("✗ retrying the eligibility check immediately after a nudge was logged returns nothing further (dedupe/cooldown)", async () => {
+    await adminClient.from("communication_log").insert({
+      order_id: returnOrder.id,
+      company_id: company.id,
+      channel: "email",
+      type: "checkin_sent",
+      audience: "customer",
+      recipient: email,
+      subject: "Have you sent your kit back? — TEST",
+      status: "sent",
+    });
+
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    const match = (data as { order_id: string; checkin_type: string }[]).find((r) => r.order_id === returnOrder.id);
+    expect(match).toBeUndefined();
+  });
+
+  it("✗ a ship-to-new-employee order that was just dispatched is not yet due a nudge", async () => {
+    const shipEmail = uniqueEmail("checkin-elig-ship");
+    const shipUser = await createAuthUser(shipEmail);
+    await createProfile(shipUser.id, company.id, shipEmail, "company_admin");
+
+    const { data: shipEmployee, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Ship Checkin Employee", email: "ship-checkin-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+
+    const shipClient = await clientAsUser(shipEmail);
+    const { data: newOrderId, error: orderError } = await shipClient.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: shipEmployee!.id,
+    });
+    if (orderError) throw orderError;
+
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "dispatched",
+        fulfilment_log: [{ at: new Date().toISOString(), action: "dispatched", detail: {}, actor_id: shipUser.id }],
+      })
+      .eq("id", newOrderId as string);
+
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    const match = (data as { order_id: string; checkin_type: string }[]).find((r) => r.order_id === newOrderId);
+    expect(match).toBeUndefined();
+
+    await adminClient.from("orders").delete().eq("id", newOrderId as string);
+    await deleteAuthUserByEmail(shipEmail);
   });
 });

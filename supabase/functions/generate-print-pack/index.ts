@@ -145,7 +145,7 @@ Deno.serve(async (req: Request) => {
   drawLine(`Order reference: ${o.reference}`, { useBold: true });
   drawLine(`Company: ${o.company?.name ?? "—"}`);
   drawLine(`Kit: ${o.kit_types?.label ?? "—"}`);
-  drawLine(`Service: ${o.service_type === "return" ? "Return to ReturnKits" : "Ship to new employee"}`);
+  drawLine(`Service: ${o.service_type === "return" ? "Return (to company address)" : "Ship to new employee"}`);
   if (o.device_reference) drawLine(`Device reference: ${o.device_reference}`);
   y -= 10;
 
