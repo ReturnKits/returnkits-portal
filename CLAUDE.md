@@ -67,7 +67,7 @@ Phases 0–5 are the launch build (~5–7 weeks); everything after is demand-dri
 
 Labels are bought **manually in Sendcloud's dashboard** until Phase 6. Deliberate — two minutes per order at launch volume, zero build time.
 
-Current phase: **0 — Foundations**.
+Current phase: **5 — Notifications**. Phases 0–4 (foundations, orders, payments, ops dashboard) are done and verified live.
 
 ## Gotchas from the prototype
 
