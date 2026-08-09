@@ -60,6 +60,7 @@ TypeScript · Next.js 15 (App Router) · Supabase (Postgres + Auth + Storage + E
 - **Invoice numbers** are a *separate*, strictly gapless Postgres sequence (UK VAT requirement). Cancelled invoices are voided, never deleted.
 - **SLA**: next-working-day dispatch, working days exclude UK bank holidays.
 - **Shipping**: Sendcloud, behind a `ShippingProvider` interface. Tracking statuses normalised to our own enum. Provider is expected to change.
+- **Employees never log in.** `employees` is a recipient directory (name, email, address, last-kit-ordered) — not a portal user, no auth identity, no RLS-scoped access of their own. The leaver/joiner just receives a physical kit. Every order action (creation, `confirm_sent`, `confirm_received`) is performed by the company's portal user who placed the order, and every notification email (confirmation, dispatched, check-ins) goes to that user (`orders.created_by` → `users.email`) — never to the employee's address on file. If a later phase wants to reach the employee directly (e.g. a delivery confirmation link, SMS), it needs its own signed/tokenized one-off flow, not portal login.
 
 ## Build order
 
