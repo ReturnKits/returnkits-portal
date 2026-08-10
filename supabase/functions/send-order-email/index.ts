@@ -111,6 +111,17 @@ const LOGO_IMG = `<img src="${LOGO_URL}" width="180" height="37" alt="ReturnKits
 // width even more precisely in Outlook specifically. border-radius on the
 // button still won't render in Outlook (square corners there) -- acceptable
 // graceful degradation, not worth a VML round-corner hack for this size app.
+//
+// Second Outlook pass (this session): the first fix pinned the width but the
+// card still rendered edge-to-edge with no visible boundary in a live
+// screenshot. Root cause -- background-color set only via CSS `style` on
+// <body> and the outer 100%-wide table, no `bgcolor` attribute. Word ignores
+// CSS background-color on table/body, so the grey page background never
+// painted and the white card had nothing to contrast against. Same class of
+// bug as the button fix: attribute, not just CSS. Also switched the card's
+// border from shorthand (`border: 1px solid ...`) to the same three-property
+// longhand already proven to work on the <hr> below -- Word's CSS parser
+// drops shorthand border on tables even when it paints bgcolor correctly.
 function layout(previewText: string, bodyHtml: string): string {
   return `<!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
@@ -129,15 +140,15 @@ function layout(previewText: string, bodyHtml: string): string {
 <![endif]-->
 <title>${escapeHtml(previewText)}</title>
 </head>
-<body style="background-color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;margin:0;padding:0;">
+<body bgcolor="#f4f4f5" style="background-color:#f4f4f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;margin:0;padding:0;">
   <div style="display:none;max-height:0;overflow:hidden;">${escapeHtml(previewText)}</div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f4f5;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f4f5" style="background-color:#f4f4f5;">
     <tr>
-      <td align="center" style="padding:24px 16px;">
+      <td align="center" bgcolor="#f4f4f5" style="background-color:#f4f4f5;padding:24px 16px;">
         <!--[if mso]>
         <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0"><tr><td>
         <![endif]-->
-        <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="background-color:#ffffff;max-width:520px;width:100%;border:1px solid #e5e7eb;">
+        <table role="presentation" width="520" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="background-color:#ffffff;max-width:520px;width:100%;border-color:#e5e7eb;border-style:solid;border-width:1px;">
           <tr>
             <td style="padding:32px;">
               <div style="margin:0 0 28px;">${LOGO_IMG}</div>
@@ -177,18 +188,21 @@ function field(label: string, value: string): string {
   </div>`;
 }
 
+// Plain bold number instead of a circular badge -- border-radius doesn't
+// render in Outlook's Word engine (see layout()'s comment), so the earlier
+// version showed as a small blue square rather than a circle. Rather than
+// fight it with a VML circle for three list items, drop the shape and keep
+// just the bold coloured numeral -- reads cleanly in every client.
 function numberedSteps(steps: string[]): string {
   const rows = steps
     .map(
       (step, i) => `<tr>
-        <td style="width:24px;vertical-align:top;padding:6px 8px 6px 0;">
-          <span style="display:inline-block;width:20px;height:20px;line-height:20px;border-radius:50%;background:#dbeafe;color:#2563eb;font-size:12px;font-weight:700;text-align:center;">${i + 1}</span>
-        </td>
+        <td style="width:20px;vertical-align:top;padding:6px 8px 6px 0;font-size:13px;font-weight:700;color:#2563eb;">${i + 1}.</td>
         <td style="padding:6px 0;font-size:14px;color:#374151;">${escapeHtml(step)}</td>
       </tr>`,
     )
     .join("");
-  return `<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin:0 0 20px;">${rows}</table>`;
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width:100%;margin:0 0 20px;">${rows}</table>`;
 }
 
 // ---- Order confirmation (bundle-aware) --------------------------------
