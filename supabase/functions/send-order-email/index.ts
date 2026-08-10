@@ -1,12 +1,19 @@
 // supabase/functions/send-order-email/index.ts
 //
-// Hand-written per CLAUDE.md. Renders one of the four launch-critical
-// transactional emails (architecture §21) and sends it via Resend. Called
-// two ways:
+// Hand-written per CLAUDE.md. Renders one of the transactional emails
+// (architecture §21) and sends it via Resend. Called two ways:
 //   1. From Postgres triggers on `orders` (payment_status -> paid,
-//      fulfilment_status -> dispatched), via pg_net.http_post -- see the
-//      Phase 5 trigger migration.
+//      fulfilment_status -> dispatched, fulfilment_status -> confirmed_sent),
+//      via pg_net.http_post -- see the Phase 5 trigger migration and its
+//      return_confirmed follow-up.
 //   2. Later, from the pg_cron check-in job (checkin_sent / checkin_received).
+//
+// return_confirmed (added post-launch, prompted by the Base44 reference
+// design's "Return Confirmed" email) closes the loop for return orders once
+// confirm_sent fires -- previously the orderer heard nothing between
+// dispatch and the next scheduled check-in nudge, which could be days.
+// ship_to_new_employee orders reach 'completed' via confirm_received with no
+// equivalent email yet -- a smaller, symmetric gap left for a follow-up.
 //
 // Templates: plain typed TypeScript functions building HTML strings, NOT
 // @react-email/components + @react-email/render as architecture §21
@@ -57,9 +64,20 @@ if (!supabaseUrl || !serviceRoleKey || !resendApiKey) {
 
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
-type EmailType = "order_confirmation" | "dispatched" | "checkin_sent" | "checkin_received";
+type EmailType = "order_confirmation" | "dispatched" | "return_confirmed" | "checkin_sent" | "checkin_received";
 
-const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_sent", "checkin_received"];
+const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "return_confirmed", "checkin_sent", "checkin_received"];
+
+// Simple substring match on the free-text courier field -- outbound_courier
+// isn't an enum (Sendcloud/Retool can type anything in), so this is a best
+// -effort hint for which carrier-specific guidance link to show, not a
+// source of truth. Unrecognised couriers just get no link, never a wrong one.
+function courierGuidanceUrl(courier: string | null): string | null {
+  const c = (courier ?? "").toLowerCase();
+  if (c.includes("royal mail")) return "https://www.postoffice.co.uk/branch-finder";
+  if (c.includes("dpd")) return "https://www.dpd.co.uk/service/pickup";
+  return null;
+}
 
 function pence(n: number): string {
   return `£${(n / 100).toFixed(2)}`;
@@ -217,23 +235,71 @@ function buildOrderConfirmationEmail(props: {
 
 // ---- Dispatched ---------------------------------------------------------
 
-function buildDispatchedEmail(props: { companyName: string; reference: string; kitLabel: string; courier: string; trackingNumber: string; trackingUrl: string | null }): string {
-  const trackingBlock = props.trackingUrl
-    ? `<div style="margin:0 0 12px;">
-        <p style="font-size:12px;color:#6b7280;margin:0;">Tracking number</p>
-        <p style="font-size:14px;font-weight:600;margin:0;"><a href="${escapeHtml(props.trackingUrl)}" style="color:#2563eb;">${escapeHtml(props.trackingNumber)}</a></p>
-      </div>`
-    : field("Tracking number", props.trackingNumber);
+function trackButton(url: string): string {
+  return `<div style="margin:16px 0 4px;">
+    <a href="${escapeHtml(url)}" style="display:inline-block;background:#2563eb;color:#ffffff;font-size:13px;font-weight:600;text-decoration:none;padding:10px 18px;border-radius:8px;">Track your delivery</a>
+  </div>`;
+}
+
+function buildDispatchedEmail(props: {
+  companyName: string;
+  reference: string;
+  kitLabel: string;
+  serviceType: string;
+  courier: string;
+  trackingNumber: string;
+  trackingUrl: string | null;
+}): string {
+  const trackingBlock = `
+    ${field("Courier", props.courier)}
+    ${field("Tracking number", props.trackingNumber)}
+    ${props.trackingUrl ? trackButton(props.trackingUrl) : ""}
+  `;
+
+  const guidanceUrl = courierGuidanceUrl(props.courier);
+  const isReturn = props.serviceType === "return";
+
+  // The box that's just gone out already contains a prepaid label for the
+  // NEXT leg -- posting the old device back to us (return orders) or, for
+  // ship-to-new-employee orders, there's nothing further for the recipient
+  // to post. Only return orders get the "how to send it back" instructions.
+  const nextStepsBlock = isReturn
+    ? `<h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">Sending the device back</h2>
+       ${numberedSteps([
+         "Pack the device securely using the materials enclosed in the kit",
+         "Attach the prepaid return label that's already inside the box — no need to print anything",
+         guidanceUrl
+           ? `Drop it off with ${escapeHtml(props.courier)}${props.courier.toLowerCase().includes("dpd") ? " (use the link below to arrange a collection)" : " (use the link below to find a drop-off point)"}`
+           : `Drop it off with ${escapeHtml(props.courier)}`,
+       ])}
+       ${guidanceUrl ? `<p style="margin:0 0 20px;"><a href="${escapeHtml(guidanceUrl)}" style="color:#2563eb;font-size:13px;text-decoration:none;font-weight:600;">${props.courier.toLowerCase().includes("dpd") ? "Arrange a DPD collection" : "Find a drop-off point"} →</a></p>`
+         : ""}`
+    : `<p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">Nothing further to do on your end once it arrives with the new starter — we'll follow up to confirm.</p>`;
 
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
     <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Your kit is on its way</h1>
     <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} has been dispatched.</p>
-    ${field("Courier", props.courier)}
     ${trackingBlock}
+    ${nextStepsBlock}
   `;
 
   return layout(`On its way — ${props.reference}`, body);
+}
+
+// ---- Return confirmed (return orders: device posted back to us) --------
+
+function buildReturnConfirmedEmail(props: { companyName: string; reference: string; kitLabel: string; returnTrackingNumber: string | null }): string {
+  const body = `
+    <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Device confirmed sent</h1>
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">
+      Thanks for confirming — ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} is on its way back to us.
+      We'll take it from here; no further action needed.
+    </p>
+    ${props.returnTrackingNumber ? field("Return tracking number", props.returnTrackingNumber) : ""}
+  `;
+  return layout(`Device confirmed sent — ${props.reference}`, body);
 }
 
 // ---- Check-in: have you sent it back? (return orders) -------------------
@@ -306,7 +372,7 @@ async function handleRequest(req: Request): Promise<Response> {
     .from("orders")
     .select(
       `id, reference, bundle_id, service_type, price_ex_vat_pence, created_by, created_at, return_address_id,
-       outbound_courier, outbound_tracking_number, outbound_tracking_url,
+       outbound_courier, outbound_tracking_number, outbound_tracking_url, return_tracking_number,
        company:companies(id, name), kit_types(label)`,
     )
     .eq("id", orderId)
@@ -328,6 +394,7 @@ async function handleRequest(req: Request): Promise<Response> {
     outbound_courier: string | null;
     outbound_tracking_number: string | null;
     outbound_tracking_url: string | null;
+    return_tracking_number: string | null;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
   };
@@ -387,7 +454,7 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Idempotency: for one-shot types, skip if any sibling order already has a sent/delivered row.
-  if (type === "order_confirmation" || type === "dispatched") {
+  if (type === "order_confirmation" || type === "dispatched" || type === "return_confirmed") {
     const { data: existing } = await supabase
       .from("communication_log")
       .select("id")
@@ -443,9 +510,18 @@ async function handleRequest(req: Request): Promise<Response> {
       companyName: o.company.name,
       reference: o.reference,
       kitLabel: o.kit_types?.label ?? "Kit",
+      serviceType: o.service_type,
       courier: o.outbound_courier ?? "Courier",
       trackingNumber: o.outbound_tracking_number ?? "—",
       trackingUrl: o.outbound_tracking_url,
+    });
+  } else if (type === "return_confirmed") {
+    subject = `Device confirmed sent — ${o.reference}`;
+    html = buildReturnConfirmedEmail({
+      companyName: o.company.name,
+      reference: o.reference,
+      kitLabel: o.kit_types?.label ?? "Kit",
+      returnTrackingNumber: o.return_tracking_number,
     });
   } else if (type === "checkin_sent") {
     subject = `Have you sent your kit back? — ${o.reference}`;
