@@ -1232,6 +1232,315 @@ describe("confirm_received() — customer-facing (Phase 4)", () => {
   });
 });
 
+describe("apply_sendcloud_tracking_event() / in_transit status (Phase 6 tracking)", () => {
+  // Tracking-only Phase 6 -- no label automation, per the user's explicit
+  // scope narrowing (20260811: "I will do labels manually but we need
+  // tracking in the portal"). This function is the single write path the
+  // sendcloud-webhook Edge Function calls after signature verification.
+  //
+  // Fixture fast-forwards both orders straight to 'dispatched' with real
+  // tracking numbers set by direct admin update, same shortcut the
+  // confirm_received block above uses -- mark_order_dispatched's own
+  // column-setting behaviour is already covered there.
+  let company: { id: string };
+  const custEmail = uniqueEmail("p6-track-cust");
+  const staffEmail = uniqueEmail("p6-track-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let returnOrderId: string;
+  let shipOrderId: string;
+  const returnTracking = `RET-${Date.now()}`;
+  const outboundTracking = `OUT-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Phase6 Tracking Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Tracking Test", email: "tracking@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(custEmail);
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: (addr as { id: string }).id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (shipError) throw shipError;
+    shipOrderId = shipId as string;
+
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", return_tracking_number: returnTracking })
+      .eq("id", returnOrderId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: outboundTracking })
+      .eq("id", shipOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a regular authenticated customer cannot call apply_sendcloud_tracking_event", async () => {
+    const client = await clientAsUser(custEmail);
+    const { error } = await client.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: outboundTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "accepted",
+      p_status_description: "Parcel has been accepted by the carrier.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ an unrecognised tracking number is acknowledged as unmatched, not an error", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: "NO-SUCH-TRACKING-NUMBER",
+      p_carrier_code: "dpd",
+      p_status_code: "accepted",
+      p_status_description: "Parcel has been accepted by the carrier.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.matched).toBe(false);
+  });
+
+  it("✓ an unmapped status_code is a no-op, not an error (unverified vocabulary stays safe)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: outboundTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "some_totally_unknown_code",
+      p_status_description: "Unrecognised",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.matched).toBe(true);
+    expect(data?.applied).toBe(false);
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+    expect(order?.fulfilment_status).toBe("dispatched"); // unchanged
+  });
+
+  it("✓ a mapped 'accepted' event transitions the outbound leg dispatched -> in_transit", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: outboundTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "accepted",
+      p_status_description: "Parcel has been accepted by the carrier.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("outbound");
+    expect(data?.new_status).toBe("in_transit");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", shipOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("in_transit");
+    const log = order?.fulfilment_log as Array<{ action: string }>;
+    expect(log.some((entry) => entry.action === "in_transit")).toBe(true);
+  });
+
+  it("✓ the same event applied again is a no-op (idempotent via the state guard, not just the dedup log)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: outboundTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "accepted",
+      p_status_description: "Parcel has been accepted by the carrier.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(false); // already in_transit, no eligible transition
+  });
+
+  it("✓ a mapped event transitions the return leg dispatched -> in_transit, matched by return_tracking_number", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: returnTracking,
+      p_carrier_code: "royal_mail",
+      p_status_code: "accepted",
+      p_status_description: "Parcel has been accepted by the carrier.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", returnOrderId).single();
+    expect(order?.fulfilment_status).toBe("in_transit");
+  });
+
+  it("✓ confirm_received still works from 'in_transit', not just 'dispatched' (widened guard)", async () => {
+    const client = await clientAsUser(custEmail);
+    const { error } = await client.rpc("confirm_received", { p_order_id: shipOrderId });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+
+  it("✓ mark_return_completed still works from 'in_transit', not just 'dispatched' (widened guard)", async () => {
+    const { error } = await adminClient.rpc("mark_return_completed", {
+      p_order_id: returnOrderId,
+      p_actor_id: staffId,
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", returnOrderId).single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+});
+
+describe("mark_return_completed() — staff-facing close-out for return orders (Phase 4 gap, closed 20260811)", () => {
+  // Covers the function itself in isolation (service_role gate, actor
+  // validation, service_type/state guards) -- the describe block above only
+  // exercises the "already in_transit" success path as a side effect of
+  // testing the tracking widening.
+  let company: { id: string };
+  const custEmail = uniqueEmail("p4-mrc-cust");
+  const staffEmail = uniqueEmail("p4-mrc-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let returnOrderId: string;
+  let shipOrderId: string;
+
+  beforeAll(async () => {
+    company = await createCompany("Phase4 MarkReturnCompleted Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "MRC Test", email: "mrc@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(custEmail);
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: (addr as { id: string }).id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (shipError) throw shipError;
+    shipOrderId = shipId as string;
+
+    await adminClient.from("orders").update({ fulfilment_status: "dispatched" }).in("id", [returnOrderId, shipOrderId]);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a regular authenticated customer cannot call mark_return_completed", async () => {
+    const client = await clientAsUser(custEmail);
+    const { error } = await client.rpc("mark_return_completed", { p_order_id: returnOrderId, p_actor_id: staffId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ service_role call with a non-internal actor_id is rejected by assert_internal_actor", async () => {
+    const client = await clientAsUser(custEmail);
+    const { data: customerUser } = await client.auth.getUser();
+    const { error } = await adminClient.rpc("mark_return_completed", {
+      p_order_id: returnOrderId,
+      p_actor_id: customerUser.user!.id,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ mark_return_completed refuses a ship_to_new_employee order", async () => {
+    const { error } = await adminClient.rpc("mark_return_completed", { p_order_id: shipOrderId, p_actor_id: staffId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ service_role with a valid internal actor completes the return order and logs both trails", async () => {
+    const { error } = await adminClient.rpc("mark_return_completed", { p_order_id: returnOrderId, p_actor_id: staffId });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", returnOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    const log = order?.fulfilment_log as Array<{ action: string }>;
+    expect(log.some((entry) => entry.action === "return_received")).toBe(true);
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action, actor_id")
+      .eq("target_id", returnOrderId)
+      .eq("action", "order.mark_return_completed");
+    expect(auditRows?.length).toBe(1);
+    expect(auditRows?.[0].actor_id).toBe(staffId);
+  });
+
+  it("✗ completing an already-completed return order again is refused (state guard)", async () => {
+    const { error } = await adminClient.rpc("mark_return_completed", { p_order_id: returnOrderId, p_actor_id: staffId });
+    expect(error).not.toBeNull();
+  });
+});
+
 describe("accept_invite() is race-safe (Base44 gotcha: atomic claim)", () => {
   it("two concurrent accepts of the same invite grant exactly one user row", async () => {
     const company = await createCompany("Race Test Co");
