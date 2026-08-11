@@ -935,7 +935,59 @@ describe("mark_order_dispatched() / create_internal_order() — the Retool write
     expect(error).not.toBeNull();
   });
 
-  it("✓ service_role with a valid internal actor dispatches the order, sets outbound_* and fulfilment_log", async () => {
+  it("✗ mark_order_dispatched refuses an unpaid order (payment gate, added 20260811)", async () => {
+    // Fixture order defaults to payment_status = 'pending' -- confirm the
+    // gate blocks dispatch before the fixture is marked paid below.
+    const { data: order } = await adminClient.from("orders").select("payment_status").eq("id", orderId).single();
+    expect(order?.payment_status).toBe("pending");
+
+    const { error } = await adminClient.rpc("mark_order_dispatched", {
+      p_order_id: orderId,
+      p_actor_id: staffId,
+      p_courier: "DPD",
+      p_tracking_number: "DPD123",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ mark_order_paid rejects a non-service_role caller", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { error } = await client.rpc("mark_order_paid", { p_order_id: orderId, p_actor_id: staffId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ mark_order_paid rejects a non-internal actor_id", async () => {
+    const client = await clientAsUser(customerEmail);
+    const { data: customerUser } = await client.auth.getUser();
+    const { error } = await adminClient.rpc("mark_order_paid", {
+      p_order_id: orderId,
+      p_actor_id: customerUser.user!.id,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ mark_order_paid marks a pending order as paid and logs it", async () => {
+    const { error } = await adminClient.rpc("mark_order_paid", { p_order_id: orderId, p_actor_id: staffId });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient.from("orders").select("payment_status").eq("id", orderId).single();
+    expect(order?.payment_status).toBe("paid");
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action, actor_id")
+      .eq("target_id", orderId)
+      .eq("action", "order.mark_paid");
+    expect(auditRows?.length).toBe(1);
+    expect(auditRows?.[0].actor_id).toBe(staffId);
+  });
+
+  it("✗ mark_order_paid refuses an order that's already paid (state guard)", async () => {
+    const { error } = await adminClient.rpc("mark_order_paid", { p_order_id: orderId, p_actor_id: staffId });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ service_role with a valid internal actor dispatches the now-paid order, sets outbound_* and fulfilment_log", async () => {
     const { error } = await adminClient.rpc("mark_order_dispatched", {
       p_order_id: orderId,
       p_actor_id: staffId,
