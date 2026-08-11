@@ -20,7 +20,9 @@
 // base64 -- Sendcloud's own PHP/Python doc examples both use
 // hash_hmac(...)/.hexdigest(), unlike Resend's Svix base64 scheme), using
 // the integration's Secret Key as the HMAC key, compared against the
-// Sendcloud-Signature header.
+// Sendcloud-Signature header. Verified 20260811 against a real "Test API
+// Webhook" delivery from Sendcloud's dashboard -- signature check passed on
+// the real thing, not just in theory.
 //
 // Scope note: this function only reacts to tracking *status* changes. It
 // never purchases labels, validates addresses, or calls any Sendcloud
