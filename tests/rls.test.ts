@@ -1138,23 +1138,18 @@ describe("update_order_tracking() — staff correction of either tracking leg (P
   });
 });
 
-describe("confirm_sent() / confirm_received() — customer-facing (Phase 4)", () => {
+describe("confirm_received() — customer-facing (Phase 4)", () => {
   let companyA: { id: string };
-  let companyB: { id: string };
   const a1Email = uniqueEmail("p4-conf-a1");
-  const bEmail = uniqueEmail("p4-conf-b1");
   let employeeA: { id: string };
   let returnOrderId: string;
   let shipOrderId: string;
 
   beforeAll(async () => {
     companyA = await createCompany("Phase4 Confirm Test Co A");
-    companyB = await createCompany("Phase4 Confirm Test Co B");
 
     const a1 = await createAuthUser(a1Email);
-    const b1 = await createAuthUser(bEmail);
     await createProfile(a1.id, companyA.id, a1Email, "company_admin");
-    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
 
     const { data: emp, error: empError } = await adminClient
       .from("employees")
@@ -1198,49 +1193,14 @@ describe("confirm_sent() / confirm_received() — customer-facing (Phase 4)", ()
 
   afterAll(async () => {
     await adminClient.from("orders").delete().eq("company_id", companyA.id);
-    for (const email of [a1Email, bEmail]) {
-      await deleteAuthUserByEmail(email);
-    }
-    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+    await deleteAuthUserByEmail(a1Email);
+    await adminClient.from("companies").delete().eq("id", companyA.id);
   });
 
-  it("✗ cross-tenant: a user in company B cannot confirm_sent on company A's order", async () => {
-    const client = await clientAsUser(bEmail);
+  it("✗ confirm_sent no longer exists as an RPC (removed 20260811090000)", async () => {
+    const client = await clientAsUser(a1Email);
     const { error } = await client.rpc("confirm_sent", { p_order_id: returnOrderId });
     expect(error).not.toBeNull();
-  });
-
-  it("✗ confirm_sent refuses a ship_to_new_employee order", async () => {
-    const client = await clientAsUser(a1Email);
-    const { error } = await client.rpc("confirm_sent", { p_order_id: shipOrderId });
-    expect(error).not.toBeNull();
-  });
-
-  it("✓ confirm_sent on the owning company's return order records actor and timestamp", async () => {
-    const client = await clientAsUser(a1Email);
-    const { data: user } = await client.auth.getUser();
-    const { error } = await client.rpc("confirm_sent", {
-      p_order_id: returnOrderId,
-      p_return_tracking_number: "RM123456",
-    });
-    expect(error).toBeNull();
-
-    const { data: order } = await adminClient
-      .from("orders")
-      .select("fulfilment_status, confirmed_sent_at, confirmed_sent_by, return_tracking_number")
-      .eq("id", returnOrderId)
-      .single();
-    expect(order?.fulfilment_status).toBe("confirmed_sent");
-    expect(order?.confirmed_sent_at).not.toBeNull();
-    expect(order?.confirmed_sent_by).toBe(user.user!.id);
-    expect(order?.return_tracking_number).toBe("RM123456");
-
-    const { data: auditRows } = await adminClient
-      .from("audit_log")
-      .select("action")
-      .eq("target_id", returnOrderId)
-      .eq("action", "order.confirm_sent");
-    expect(auditRows?.length).toBe(1);
   });
 
   it("✗ confirm_received refuses a return order", async () => {

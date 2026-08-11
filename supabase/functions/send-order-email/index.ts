@@ -3,33 +3,35 @@
 // Hand-written per CLAUDE.md. Renders one of the transactional emails
 // (architecture §21) and sends it via Resend. Called two ways:
 //   1. From Postgres triggers on `orders` (payment_status -> paid,
-//      fulfilment_status -> dispatched, fulfilment_status -> confirmed_sent),
-//      via pg_net.http_post -- see the Phase 5 trigger migration and its
-//      return_confirmed follow-up.
-//   2. Later, from the pg_cron check-in job (checkin_sent / checkin_received).
+//      fulfilment_status -> dispatched), via pg_net.http_post -- see the
+//      Phase 5 trigger migration.
+//   2. From the pg_cron check-in job (checkin_sent / checkin_received).
 //
-// return_confirmed (added post-launch, prompted by the Base44 reference
-// design's "Return Confirmed" email) closes the loop for return orders once
-// confirm_sent fires -- previously the orderer heard nothing between
-// dispatch and the next scheduled check-in nudge, which could be days.
-// ship_to_new_employee orders reach 'completed' via confirm_received with no
-// equivalent email yet -- a smaller, symmetric gap left for a follow-up.
+// return_confirmed (added, then removed same week) briefly closed the loop
+// for return orders once a customer self-reported posting the device back.
+// Retired in 20260811090000_remove_confirm_sent.sql: a customer's own
+// say-so isn't a reliable signal, and it silently exempted the order from
+// the check-in nudge. Return orders now just stay 'dispatched' until either
+// staff record physical receipt or (later, deferred) Sendcloud tracking
+// confirms it -- checkin_sent keeps nudging every few days in the meantime,
+// which is the intended behaviour now, not a gap.
 //
 // Templates: plain typed TypeScript functions building HTML strings, NOT
 // @react-email/components + @react-email/render as architecture §21
 // originally specified. Deliberate substitution, same category as pdf-lib
-// over React-PDF elsewhere in this codebase: a live test (Phase 5, this
-// session) showed React's server-render path crashing at boot in this
-// project's Deno edge runtime (500, no captured log line -- consistent with
-// an npm import failure during module init, before any request-level code
-// runs). The architectural INTENT survives -- typed functions taking typed
-// props, one place per template, no copy-pasted markup -- only the specific
-// rendering mechanism changes.
+// over React-PDF elsewhere in this codebase: a live test (Phase 5) showed
+// React's server-render path crashing at boot in this project's Deno edge
+// runtime (500, no captured log line -- consistent with an npm import
+// failure during module init, before any request-level code runs). The
+// architectural INTENT survives -- typed functions taking typed props, one
+// place per template, no copy-pasted markup -- only the specific rendering
+// mechanism changes.
 //
 // Visual style matched against the Base44 prototype's confirmation email
 // (user-supplied reference screenshot) rather than invented from scratch:
-// wordmark header, order meta line, itemised pricing, a "Return destination"
-// block for return orders, numbered "what happens next" steps.
+// wordmark header, order meta line, itemised pricing, a destination block
+// (return address, or the new starter's shipping address), numbered
+// "what happens next" steps.
 //
 // Auth: same shared-service_role model as the rest of this project's
 // internal write API (mark_order_dispatched, generate-print-pack) --
@@ -48,7 +50,7 @@
 // "duplicate" differs by type -- one-shot for order_confirmation/dispatched,
 // but checkin_* are expected to legitimately repeat over an order's life
 // (a fresh nudge every few working days) and get their own dedupe scheme
-// once the cron job (Phase 5, later) is built.
+// (the 3-day cooldown in orders_needing_checkin()).
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { captureError } from "../_shared/sentry.ts";
@@ -64,9 +66,9 @@ if (!supabaseUrl || !serviceRoleKey || !resendApiKey) {
 
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
-type EmailType = "order_confirmation" | "dispatched" | "return_confirmed" | "checkin_sent" | "checkin_received";
+type EmailType = "order_confirmation" | "dispatched" | "checkin_sent" | "checkin_received";
 
-const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "return_confirmed", "checkin_sent", "checkin_received"];
+const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_sent", "checkin_received"];
 
 // Simple substring match on the free-text courier field -- outbound_courier
 // isn't an enum (Sendcloud/Retool can type anything in), so this is a best
@@ -91,6 +93,16 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric" });
 }
 
+// Single flowing line ("66 Sandhill Oval, Leeds, LS17 8EE") -- used for both
+// return addresses and a new starter's shipping address, so the two
+// "destination" blocks in the templates below render identically.
+function formatAddressLine(line1: string | null, line2: string | null, city: string | null, postcode: string | null): string {
+  return [line1, line2, city && postcode ? `${city}, ${postcode}` : city || postcode]
+    .filter(Boolean)
+    .map((part) => escapeHtml(part as string))
+    .join(", ");
+}
+
 // ---- Shared layout ----------------------------------------------------
 
 // Hosted in the public brand-assets Storage bucket (uploaded once via the
@@ -112,11 +124,11 @@ const LOGO_IMG = `<img src="${LOGO_URL}" width="180" height="37" alt="ReturnKits
 // button still won't render in Outlook (square corners there) -- acceptable
 // graceful degradation, not worth a VML round-corner hack for this size app.
 //
-// Second Outlook pass (this session): the first fix pinned the width but the
-// card still rendered edge-to-edge with no visible boundary in a live
-// screenshot. Root cause -- background-color set only via CSS `style` on
-// <body> and the outer 100%-wide table, no `bgcolor` attribute. Word ignores
-// CSS background-color on table/body, so the grey page background never
+// Second Outlook pass: the first fix pinned the width but the card still
+// rendered edge-to-edge with no visible boundary in a live screenshot. Root
+// cause -- background-color set only via CSS `style` on <body> and the
+// outer 100%-wide table, no `bgcolor` attribute. Word ignores CSS
+// background-color on table/body, so the grey page background never
 // painted and the white card had nothing to contrast against. Same class of
 // bug as the button fix: attribute, not just CSS. Also switched the card's
 // border from shorthand (`border: 1px solid ...`) to the same three-property
@@ -154,8 +166,7 @@ function layout(previewText: string, bodyHtml: string): string {
               <div style="margin:0 0 28px;">${LOGO_IMG}</div>
               ${bodyHtml}
               <hr style="border-color:#e5e7eb;border-style:solid;border-width:1px 0 0;margin:28px 0 16px;" />
-              <div style="margin:0 0 4px;">${LOGO_IMG}</div>
-              <p style="font-size:12px;color:#9ca3af;margin:8px 0 8px;">
+              <p style="font-size:12px;color:#9ca3af;margin:0 0 8px;">
                 <a href="https://returnkits.com" style="color:#9ca3af;text-decoration:none;">returnkits.com</a>
                 &nbsp;·&nbsp;
                 <a href="mailto:support@returnkits.com" style="color:#9ca3af;text-decoration:none;">support@returnkits.com</a>
@@ -188,6 +199,15 @@ function field(label: string, value: string): string {
   </div>`;
 }
 
+// A single "who/where this is going" block -- shared markup for a return
+// order's return address and a ship-to-new-employee order's recipient, so
+// both templates present destination info identically.
+function destinationBlock(heading: string, name: string, addressLine: string): string {
+  return `<h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 8px;">${escapeHtml(heading)}</h2>
+    <p style="font-size:14px;color:#111827;margin:0 0 2px;font-weight:600;">${escapeHtml(name)}</p>
+    <p style="font-size:14px;color:#374151;margin:0;line-height:20px;">${addressLine}</p>`;
+}
+
 // Plain bold number instead of a circular badge -- border-radius doesn't
 // render in Outlook's Word engine (see layout()'s comment), so the earlier
 // version showed as a small blue square rather than a circle. Rather than
@@ -207,7 +227,14 @@ function numberedSteps(steps: string[]): string {
 
 // ---- Order confirmation (bundle-aware) --------------------------------
 
-type ConfirmationLine = { reference: string; kitLabel: string; serviceType: string; priceExVatPence: number };
+type ConfirmationLine = {
+  reference: string;
+  kitLabel: string;
+  serviceType: string;
+  priceExVatPence: number;
+  employeeName: string | null;
+  employeeAddress: string | null;
+};
 type ReturnAddress = { label: string | null; address_line1: string; address_line2: string | null; city: string; postcode: string; country: string };
 
 function buildOrderConfirmationEmail(props: {
@@ -242,25 +269,32 @@ function buildOrderConfirmationEmail(props: {
 
   const hasReturn = props.lines.some((l) => l.serviceType === "return");
   const hasShipToEmployee = props.lines.some((l) => l.serviceType !== "return");
-  const steps: string[] = ["We prepare and dispatch your kit"];
+  const steps: string[] = ["We dispatch within 1 working day"];
   if (hasReturn) steps.push("Recipient packs the device securely", "Device returned via prepaid tracked label");
   if (hasShipToEmployee) steps.push("New starter receives and sets up their kit");
 
-  // Single flowing address line ("66 Sandhill Oval, Leeds, LS17 8EE") to
-  // match the reference design, rather than street on its own line and
-  // city/postcode on the next.
-  const addressLine = props.returnAddress
-    ? [props.returnAddress.address_line1, props.returnAddress.address_line2, `${props.returnAddress.city}, ${props.returnAddress.postcode}`]
-        .filter(Boolean)
-        .map((part) => escapeHtml(part as string))
-        .join(", ")
+  const returnAddressLine = props.returnAddress
+    ? formatAddressLine(props.returnAddress.address_line1, props.returnAddress.address_line2, props.returnAddress.city, props.returnAddress.postcode)
+    : "";
+  const returnBlock = props.returnAddress
+    ? destinationBlock("Return destination", props.returnAddress.label ?? props.companyName, returnAddressLine)
     : "";
 
-  const returnBlock = props.returnAddress
-    ? `<h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 8px;">Return destination</h2>
-       <p style="font-size:14px;color:#111827;margin:0 0 2px;font-weight:600;">${escapeHtml(props.returnAddress.label ?? props.companyName)}</p>
-       <p style="font-size:14px;color:#374151;margin:0;line-height:20px;">${addressLine}</p>`
-    : "";
+  // One block per distinct new-starter recipient -- lets whoever placed the
+  // order double-check the name/address before it ships, since the employee
+  // themself never sees this email (CLAUDE.md: employees never log in, and
+  // only orders.created_by is ever emailed).
+  const seenEmployees = new Set<string>();
+  const shippingBlocks = props.lines
+    .filter((l) => l.serviceType !== "return" && l.employeeName)
+    .filter((l) => {
+      const key = `${l.employeeName}|${l.employeeAddress}`;
+      if (seenEmployees.has(key)) return false;
+      seenEmployees.add(key);
+      return true;
+    })
+    .map((l) => destinationBlock("Shipping to", l.employeeName as string, l.employeeAddress ?? ""))
+    .join("");
 
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(primaryRef)}${moreCount > 0 ? ` (+${moreCount} more)` : ""} · ${formatDate(props.createdAt)}</p>
@@ -277,6 +311,7 @@ function buildOrderConfirmationEmail(props: {
       <tr><td style="padding:6px 0 0;font-size:15px;color:#111827;font-weight:700;">Total paid</td><td style="padding:6px 0 0;font-size:15px;color:#111827;font-weight:700;text-align:right;">${pence(totalIncVat)}</td></tr>
     </table>
     ${returnBlock}
+    ${shippingBlocks}
     <h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">What happens next</h2>
     ${numberedSteps(steps)}
     <p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">Questions about your order? Just reply to this email, or reach us at <a href="mailto:support@returnkits.com" style="color:#2563eb;text-decoration:none;">support@returnkits.com</a>.</p>
@@ -307,7 +342,15 @@ function buildDispatchedEmail(props: {
   courier: string;
   trackingNumber: string;
   trackingUrl: string | null;
+  employeeName: string | null;
+  employeeAddress: string | null;
 }): string {
+  const isReturn = props.serviceType === "return";
+
+  // Same reasoning as the confirmation email's shipping block -- the person
+  // reading this isn't the recipient, so show them who/where it's going.
+  const shippingBlock = !isReturn && props.employeeName ? destinationBlock("Shipping to", props.employeeName, props.employeeAddress ?? "") : "";
+
   const trackingBlock = `
     ${field("Courier", props.courier)}
     ${field("Tracking number", props.trackingNumber)}
@@ -315,7 +358,6 @@ function buildDispatchedEmail(props: {
   `;
 
   const guidanceUrl = courierGuidanceUrl(props.courier);
-  const isReturn = props.serviceType === "return";
 
   // The box that's just gone out already contains a prepaid label for the
   // NEXT leg -- posting the old device back to us (return orders) or, for
@@ -338,6 +380,7 @@ function buildDispatchedEmail(props: {
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
     <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Your kit is on its way</h1>
     <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} has been dispatched.</p>
+    ${shippingBlock}
     ${trackingBlock}
     ${nextStepsBlock}
   `;
@@ -345,34 +388,26 @@ function buildDispatchedEmail(props: {
   return layout(`On its way — ${props.reference}`, body);
 }
 
-// ---- Return confirmed (return orders: device posted back to us) --------
-
-function buildReturnConfirmedEmail(props: { companyName: string; reference: string; kitLabel: string; returnTrackingNumber: string | null }): string {
-  const body = `
-    <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
-    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Device confirmed sent</h1>
-    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">
-      Thanks for confirming — ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} is on its way back to us.
-      We'll take it from here; no further action needed.
-    </p>
-    ${props.returnTrackingNumber ? field("Return tracking number", props.returnTrackingNumber) : ""}
-  `;
-  return layout(`Device confirmed sent — ${props.reference}`, body);
-}
-
 // ---- Check-in: have you sent it back? (return orders) -------------------
 
+// No longer asks the customer to confirm anything -- confirm_sent was
+// removed (20260811090000_remove_confirm_sent.sql) because a self-reported
+// "yes I sent it" isn't verifiable. This is now a plain reminder with no
+// action to take beyond actually posting the device; orders_needing_checkin()
+// keeps sending this every few days for as long as the order sits in
+// 'dispatched', which is the point -- reminders continue until it's
+// actually sent.
 function buildCheckinSentEmail(props: { companyName: string; reference: string; kitLabel: string }): string {
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
-    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just checking in</h1>
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
     <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-      We haven't heard back on ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} yet.
-      If it's already on its way back to us, you can confirm this in your portal so we can stop chasing.
-      If it hasn't been posted yet, no rush — just let us know if anything's blocking it.
+      We haven't seen ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} come back to us yet.
+      When you get a chance, please post it back using the prepaid label included in the original kit —
+      no need to let us know, we'll take it from there once it arrives.
     </p>
   `;
-  return layout(`Have you sent your kit back? — ${props.reference}`, body);
+  return layout(`Reminder: please send your kit back — ${props.reference}`, body);
 }
 
 // ---- Check-in: has it arrived? (ship-to-new-employee orders) ------------
@@ -430,8 +465,9 @@ async function handleRequest(req: Request): Promise<Response> {
     .from("orders")
     .select(
       `id, reference, bundle_id, service_type, price_ex_vat_pence, created_by, created_at, return_address_id,
-       outbound_courier, outbound_tracking_number, outbound_tracking_url, return_tracking_number,
-       company:companies(id, name), kit_types(label)`,
+       outbound_courier, outbound_tracking_number, outbound_tracking_url, employee_id,
+       company:companies(id, name), kit_types(label),
+       employees(full_name, address_line1, address_line2, city, postcode, country)`,
     )
     .eq("id", orderId)
     .maybeSingle();
@@ -452,14 +488,19 @@ async function handleRequest(req: Request): Promise<Response> {
     outbound_courier: string | null;
     outbound_tracking_number: string | null;
     outbound_tracking_url: string | null;
-    return_tracking_number: string | null;
+    employee_id: string;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
+    employees: { full_name: string; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
   };
 
   if (!o.company) {
     return new Response(JSON.stringify({ error: "Order has no company" }), { status: 500 });
   }
+
+  const employeeAddress = o.employees
+    ? formatAddressLine(o.employees.address_line1, o.employees.address_line2, o.employees.city, o.employees.postcode)
+    : null;
 
   // notification_preferences gate (architecture §5: checked before every send)
   const { data: enabled } = await supabase.rpc("notification_enabled", {
@@ -483,7 +524,14 @@ async function handleRequest(req: Request): Promise<Response> {
   // Bundle-aware order_confirmation: gather sibling orders, dedupe across all of them.
   let siblingOrderIds = [o.id];
   let confirmationLines: ConfirmationLine[] = [
-    { reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit", serviceType: o.service_type, priceExVatPence: o.price_ex_vat_pence },
+    {
+      reference: o.reference,
+      kitLabel: o.kit_types?.label ?? "Kit",
+      serviceType: o.service_type,
+      priceExVatPence: o.price_ex_vat_pence,
+      employeeName: o.employees?.full_name ?? null,
+      employeeAddress,
+    },
   ];
   let bundleReference: string | null = null;
   let returnAddressId: string | null = o.return_address_id;
@@ -494,25 +542,32 @@ async function handleRequest(req: Request): Promise<Response> {
 
     const { data: siblings } = await supabase
       .from("orders")
-      .select("id, reference, service_type, price_ex_vat_pence, return_address_id, created_at, kit_types(label)")
+      .select(
+        "id, reference, service_type, price_ex_vat_pence, return_address_id, created_at, kit_types(label), employees(full_name, address_line1, address_line2, city, postcode, country)",
+      )
       .eq("bundle_id", o.bundle_id)
       .order("created_at", { ascending: true });
 
     if (siblings && siblings.length > 0) {
       siblingOrderIds = siblings.map((s) => s.id as string);
-      confirmationLines = siblings.map((s) => ({
-        reference: s.reference as string,
-        kitLabel: (s as unknown as { kit_types: { label: string } | null }).kit_types?.label ?? "Kit",
-        serviceType: s.service_type as string,
-        priceExVatPence: s.price_ex_vat_pence as number,
-      }));
+      confirmationLines = siblings.map((s) => {
+        const emp = (s as unknown as { employees: { full_name: string; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null } | null }).employees;
+        return {
+          reference: s.reference as string,
+          kitLabel: (s as unknown as { kit_types: { label: string } | null }).kit_types?.label ?? "Kit",
+          serviceType: s.service_type as string,
+          priceExVatPence: s.price_ex_vat_pence as number,
+          employeeName: emp?.full_name ?? null,
+          employeeAddress: emp ? formatAddressLine(emp.address_line1, emp.address_line2, emp.city, emp.postcode) : null,
+        };
+      });
       const withReturnAddress = siblings.find((s) => s.return_address_id);
       returnAddressId = (withReturnAddress?.return_address_id as string | undefined) ?? null;
     }
   }
 
   // Idempotency: for one-shot types, skip if any sibling order already has a sent/delivered row.
-  if (type === "order_confirmation" || type === "dispatched" || type === "return_confirmed") {
+  if (type === "order_confirmation" || type === "dispatched") {
     const { data: existing } = await supabase
       .from("communication_log")
       .select("id")
@@ -572,17 +627,11 @@ async function handleRequest(req: Request): Promise<Response> {
       courier: o.outbound_courier ?? "Courier",
       trackingNumber: o.outbound_tracking_number ?? "—",
       trackingUrl: o.outbound_tracking_url,
-    });
-  } else if (type === "return_confirmed") {
-    subject = `Device confirmed sent — ${o.reference}`;
-    html = buildReturnConfirmedEmail({
-      companyName: o.company.name,
-      reference: o.reference,
-      kitLabel: o.kit_types?.label ?? "Kit",
-      returnTrackingNumber: o.return_tracking_number,
+      employeeName: o.employees?.full_name ?? null,
+      employeeAddress,
     });
   } else if (type === "checkin_sent") {
-    subject = `Have you sent your kit back? — ${o.reference}`;
+    subject = `Reminder: please send your kit back — ${o.reference}`;
     html = buildCheckinSentEmail({ companyName: o.company.name, reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit" });
   } else {
     subject = `Has your kit arrived? — ${o.reference}`;
