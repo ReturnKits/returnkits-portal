@@ -2589,3 +2589,478 @@ describe("Enhanced Cover — cover_tiers, order snapshotting, and flag_cover_cla
     expect(invoice!.subtotal_ex_vat_pence + invoice!.vat_pence).toBe(invoice!.total_inc_vat_pence);
   });
 });
+
+describe("Prepaid credits — credit_ledger RLS, redemption, purchase, and restoration (20260812)", () => {
+  // Scope confirmed with the user: prepaid credits only (no free-kit promo),
+  // same per-unit price as self-serve kit_types, saved card for topping up
+  // only. See CLAUDE.md's credits locked decision and
+  // 20260812220000_credits_schema_and_rpcs.sql.
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const a1Email = uniqueEmail("credit-a1");
+  const a2Email = uniqueEmail("credit-a2");
+  const bEmail = uniqueEmail("credit-b1");
+  const staffEmail = uniqueEmail("credit-staff");
+  let staffId: string;
+  let employeeA: { id: string };
+
+  beforeAll(async () => {
+    companyA = await createCompany("Credits Test Co A");
+    companyB = await createCompany("Credits Test Co B");
+
+    const a1 = await createAuthUser(a1Email);
+    const a2 = await createAuthUser(a2Email);
+    const b1 = await createAuthUser(bEmail);
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+    await createProfile(a2.id, companyA.id, a2Email, "company_member");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Credit Test Employee", email: "credit-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().in("company_id", [companyA.id, companyB.id]);
+    await adminClient.from("credit_ledger").delete().in("company_id", [companyA.id, companyB.id]);
+    await adminClient.from("invoices").delete().in("company_id", [companyA.id, companyB.id]);
+    for (const email of [a1Email, a2Email, bEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  // Balance helper mirrors the SQL in create_order/record_credit_purchase/
+  // cancel_order exactly: sum of credit quantities minus sum of debit
+  // quantities for a given company + kit type.
+  async function balanceFor(companyId: string, kitTypeId: string): Promise<number> {
+    const { data, error } = await adminClient
+      .from("credit_ledger")
+      .select("direction, quantity")
+      .eq("company_id", companyId)
+      .eq("kit_type_id", kitTypeId);
+    if (error) throw error;
+    return (data ?? []).reduce((sum, row) => sum + (row.direction === "credit" ? row.quantity : -row.quantity), 0);
+  }
+
+  describe("RLS: public.credit_ledger — isolation, collaboration, and no client writes", () => {
+    it("✗ isolation: a company B user cannot read company A's ledger rows", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "laptop",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 5,
+        balance_after: 5,
+        reason: "seed for isolation test",
+      });
+
+      const client = await clientAsUser(bEmail);
+      const { data, error } = await client.from("credit_ledger").select("*").eq("company_id", companyA.id);
+      expect(error).toBeNull();
+      expect(data).toEqual([]);
+    });
+
+    it("✓ collaboration: a second user in company A can read company A's ledger rows", async () => {
+      const client = await clientAsUser(a2Email);
+      const { data, error } = await client
+        .from("credit_ledger")
+        .select("kit_type_id")
+        .eq("company_id", companyA.id);
+      expect(error).toBeNull();
+      expect((data ?? []).length).toBeGreaterThan(0);
+    });
+
+    it("✓ admin override: internal_ops reads ledger rows across companies", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyB.id,
+        kit_type_id: "phone",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 3,
+        balance_after: 3,
+        reason: "seed for admin override test",
+      });
+
+      const client = await clientAsUser(staffEmail);
+      const { data, error } = await client
+        .from("credit_ledger")
+        .select("company_id")
+        .in("company_id", [companyA.id, companyB.id]);
+      expect(error).toBeNull();
+      const seen = new Set((data ?? []).map((row) => row.company_id));
+      expect(seen.has(companyA.id)).toBe(true);
+      expect(seen.has(companyB.id)).toBe(true);
+    });
+
+    it("✗ append-only: an authenticated client cannot insert into credit_ledger directly", async () => {
+      const client = await clientAsUser(a1Email);
+      const { error } = await client.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "laptop",
+        transaction_type: "adjustment",
+        direction: "credit",
+        quantity: 1000,
+        balance_after: 1000,
+        reason: "attempted forged credit",
+      });
+      expect(error).not.toBeNull();
+    });
+  });
+
+  describe("create_order() credit redemption", () => {
+    it("✗ refuses to redeem when the balance is zero", async () => {
+      const client = await clientAsUser(a1Email);
+      const { error } = await client.rpc("create_order", {
+        p_kit_type_id: "monitor",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_pay_with_credit: true,
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it("✗ refuses to combine pay-with-credit and Enhanced Cover on the same order", async () => {
+      // Grant a balance first so the rejection is provably about the
+      // cover/credit combination, not insufficient funds.
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "monitor",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: 1,
+        reason: "seed for cover+credit rejection test",
+      });
+
+      const client = await clientAsUser(a1Email);
+      const { error } = await client.rpc("create_order", {
+        p_kit_type_id: "monitor",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_cover_tier_id: "up_to_500",
+        p_pay_with_credit: true,
+      });
+      expect(error).not.toBeNull();
+
+      const balance = await balanceFor(companyA.id, "monitor");
+      expect(balance).toBe(1); // untouched — the rejected call must not have debited anything
+    });
+
+    it("✓ redeems a credit: order is created paid, snapshotted to its ledger debit, and the balance drops by one", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "laptop",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 2,
+        balance_after: 2,
+        reason: "seed for redemption test",
+      });
+      const balanceBefore = await balanceFor(companyA.id, "laptop");
+      expect(balanceBefore).toBe(2);
+
+      const client = await clientAsUser(a1Email);
+      const { data: orderId, error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_pay_with_credit: true,
+      });
+      expect(error).toBeNull();
+
+      const { data: order } = await adminClient
+        .from("orders")
+        .select("payment_status, paid_with_credit, credit_transaction_id")
+        .eq("id", orderId as string)
+        .single();
+      expect(order?.payment_status).toBe("paid");
+      expect(order?.paid_with_credit).toBe(true);
+      expect(order?.credit_transaction_id).not.toBeNull();
+
+      const { data: ledgerRow } = await adminClient
+        .from("credit_ledger")
+        .select("direction, quantity, balance_after, order_id")
+        .eq("id", order!.credit_transaction_id as string)
+        .single();
+      expect(ledgerRow?.direction).toBe("debit");
+      expect(ledgerRow?.quantity).toBe(1);
+      expect(ledgerRow?.order_id).toBe(orderId);
+      expect(ledgerRow?.balance_after).toBe(1);
+
+      const balanceAfter = await balanceFor(companyA.id, "laptop");
+      expect(balanceAfter).toBe(1);
+    });
+
+    it("✗ database constraint: paid_with_credit and credit_transaction_id must agree (orders_credit_snapshot_consistent)", async () => {
+      const { error } = await adminClient.from("orders").insert({
+        company_id: companyA.id,
+        reference: `RKL-260812-${Math.floor(Math.random() * 900) + 100}`,
+        kit_type_id: "laptop",
+        service_type: "ship_to_new_employee",
+        source: "internal_staff",
+        created_by: staffId,
+        employee_id: employeeA.id,
+        price_ex_vat_pence: 6500,
+        payment_status: "paid",
+        paid_with_credit: true,
+        credit_transaction_id: null,
+      } as never);
+      expect(error).not.toBeNull();
+    });
+
+    it("✗ database constraint: a credit-paid order cannot also carry Enhanced Cover (orders_credit_excludes_cover)", async () => {
+      // Needs a real credit_ledger row to satisfy the FK on
+      // credit_transaction_id — this is testing the CHECK constraint
+      // specifically, isolated from the FK and the snapshot-consistency
+      // constraint (both satisfied here on purpose).
+      const { data: ledgerRow, error: ledgerError } = await adminClient
+        .from("credit_ledger")
+        .insert({
+          company_id: companyA.id,
+          kit_type_id: "monitor",
+          transaction_type: "redemption",
+          direction: "debit",
+          quantity: 1,
+          balance_after: 0,
+          reason: "seed for constraint isolation test",
+        })
+        .select()
+        .single();
+      if (ledgerError) throw ledgerError;
+
+      const { error } = await adminClient.from("orders").insert({
+        company_id: companyA.id,
+        reference: `RKM-260812-${Math.floor(Math.random() * 900) + 100}`,
+        kit_type_id: "monitor",
+        service_type: "ship_to_new_employee",
+        source: "internal_staff",
+        created_by: staffId,
+        employee_id: employeeA.id,
+        price_ex_vat_pence: 8500,
+        payment_status: "paid",
+        paid_with_credit: true,
+        credit_transaction_id: (ledgerRow as { id: string }).id,
+        cover_tier_id: "up_to_500",
+        cover_price_ex_vat_pence: 500,
+      } as never);
+      expect(error).not.toBeNull();
+    });
+
+    it("✓ race safety: two concurrent redemptions against a balance of one grant exactly one order", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "phone",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: 1,
+        reason: "seed for race test",
+      });
+
+      const client = await clientAsUser(a1Email);
+      const [first, second] = await Promise.all([
+        client.rpc("create_order", {
+          p_kit_type_id: "phone",
+          p_service_type: "ship_to_new_employee",
+          p_employee_id: employeeA.id,
+          p_pay_with_credit: true,
+        }),
+        client.rpc("create_order", {
+          p_kit_type_id: "phone",
+          p_service_type: "ship_to_new_employee",
+          p_employee_id: employeeA.id,
+          p_pay_with_credit: true,
+        }),
+      ]);
+
+      const successes = [first, second].filter((r) => r.error === null);
+      const failures = [first, second].filter((r) => r.error !== null);
+      expect(successes.length).toBe(1);
+      expect(failures.length).toBe(1);
+
+      const balance = await balanceFor(companyA.id, "phone");
+      expect(balance).toBe(0); // exactly one debit landed, not zero and not two
+    });
+  });
+
+  describe("record_credit_purchase() — webhook-only, atomic, idempotent", () => {
+    it("✗ an authenticated client cannot call record_credit_purchase directly", async () => {
+      const client = await clientAsUser(a1Email);
+      const { error } = await client.rpc("record_credit_purchase", {
+        p_event_id: `evt_forged_credit_${Date.now()}`,
+        p_event_type: "checkout.session.completed",
+        p_checkout_session_id: `cs_forged_credit_${Date.now()}`,
+        p_payment_intent_id: null,
+        p_company_id: companyA.id,
+        p_kit_type_id: "laptop",
+        p_quantity: 100,
+        p_subtotal_ex_vat_pence: 650000,
+        p_vat_pence: 130000,
+        p_total_inc_vat_pence: 780000,
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it("✓ service_role: issues an invoice, credits the ledger, and the balance goes up by the purchased quantity", async () => {
+      const balanceBefore = await balanceFor(companyA.id, "tablet");
+      const eventId = `evt_credit_${Date.now()}`;
+      const sessionId = `cs_credit_${Date.now()}`;
+
+      const { data: invoiceId, error } = await adminClient.rpc("record_credit_purchase", {
+        p_event_id: eventId,
+        p_event_type: "checkout.session.completed",
+        p_checkout_session_id: sessionId,
+        p_payment_intent_id: `pi_${sessionId}`,
+        p_company_id: companyA.id,
+        p_kit_type_id: "tablet",
+        p_quantity: 5,
+        p_subtotal_ex_vat_pence: 5000,
+        p_vat_pence: 1000,
+        p_total_inc_vat_pence: 6000,
+      });
+      expect(error).toBeNull();
+      expect(invoiceId).not.toBeNull();
+
+      const { data: invoice } = await adminClient
+        .from("invoices")
+        .select("total_inc_vat_pence, invoice_number")
+        .eq("id", invoiceId as string)
+        .single();
+      expect(invoice?.total_inc_vat_pence).toBe(6000);
+      expect(Number.isInteger(invoice?.invoice_number)).toBe(true);
+
+      const balanceAfter = await balanceFor(companyA.id, "tablet");
+      expect(balanceAfter).toBe(balanceBefore + 5);
+    });
+
+    it("✓ replaying the same event id twice changes nothing", async () => {
+      const balanceBefore = await balanceFor(companyA.id, "accessories");
+      const eventId = `evt_credit_replay_${Date.now()}`;
+      const args = {
+        p_event_id: eventId,
+        p_event_type: "checkout.session.completed",
+        p_checkout_session_id: `cs_credit_replay_${Date.now()}`,
+        p_payment_intent_id: null,
+        p_company_id: companyA.id,
+        p_kit_type_id: "accessories",
+        p_quantity: 10,
+        p_subtotal_ex_vat_pence: 1000,
+        p_vat_pence: 200,
+        p_total_inc_vat_pence: 1200,
+      };
+
+      const first = await adminClient.rpc("record_credit_purchase", args);
+      expect(first.error).toBeNull();
+      expect(first.data).not.toBeNull();
+
+      const second = await adminClient.rpc("record_credit_purchase", args);
+      expect(second.error).toBeNull();
+      expect(second.data).toBeNull(); // idempotent replay short-circuits before crediting again
+
+      const balanceAfter = await balanceFor(companyA.id, "accessories");
+      expect(balanceAfter).toBe(balanceBefore + 10); // not +20
+
+      const { count: invoiceCount } = await adminClient
+        .from("invoices")
+        .select("id", { count: "exact", head: true })
+        .eq("stripe_checkout_session_id", args.p_checkout_session_id);
+      expect(invoiceCount).toBe(1);
+    });
+  });
+
+  describe("record_card_setup() — webhook-only", () => {
+    it("✗ an authenticated client cannot call record_card_setup directly", async () => {
+      const client = await clientAsUser(a1Email);
+      const { error } = await client.rpc("record_card_setup", {
+        p_company_id: companyA.id,
+        p_stripe_payment_method_id: "pm_forged",
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it("✓ service_role: caches the payment method id and logs to audit_log", async () => {
+      const { error } = await adminClient.rpc("record_card_setup", {
+        p_company_id: companyA.id,
+        p_stripe_payment_method_id: "pm_test_saved_card",
+      });
+      expect(error).toBeNull();
+
+      const { data: company } = await adminClient
+        .from("companies")
+        .select("stripe_payment_method_id")
+        .eq("id", companyA.id)
+        .single();
+      expect(company?.stripe_payment_method_id).toBe("pm_test_saved_card");
+
+      const { data: auditRows } = await adminClient
+        .from("audit_log")
+        .select("action, target_id")
+        .eq("target_id", companyA.id)
+        .eq("action", "company.card_setup");
+      expect(auditRows?.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("cancel_order() restores a redeemed credit", () => {
+    it("✓ cancelling a credit-paid order (still awaiting dispatch) puts the credit back", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "monitor",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: 1,
+        reason: "seed for cancel-restores-credit test",
+      });
+      const balanceBeforeRedeem = await balanceFor(companyA.id, "monitor");
+
+      const client = await clientAsUser(a1Email);
+      const { data: orderId, error: createError } = await client.rpc("create_order", {
+        p_kit_type_id: "monitor",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_pay_with_credit: true,
+      });
+      expect(createError).toBeNull();
+
+      const balanceAfterRedeem = await balanceFor(companyA.id, "monitor");
+      expect(balanceAfterRedeem).toBe(balanceBeforeRedeem - 1);
+
+      const { error: cancelError } = await adminClient.rpc("cancel_order", {
+        p_order_id: orderId as string,
+        p_actor_id: staffId,
+        p_reason: "Testing credit restoration",
+      });
+      expect(cancelError).toBeNull();
+
+      const { data: order } = await adminClient
+        .from("orders")
+        .select("fulfilment_status, payment_status")
+        .eq("id", orderId as string)
+        .single();
+      expect(order?.fulfilment_status).toBe("cancelled");
+      expect(order?.payment_status).toBe("cancelled");
+
+      const balanceAfterCancel = await balanceFor(companyA.id, "monitor");
+      expect(balanceAfterCancel).toBe(balanceBeforeRedeem); // fully restored
+
+      const { data: restorationRow } = await adminClient
+        .from("credit_ledger")
+        .select("transaction_type, direction, quantity, order_id")
+        .eq("order_id", orderId as string)
+        .eq("transaction_type", "adjustment")
+        .maybeSingle();
+      expect(restorationRow?.direction).toBe("credit");
+      expect(restorationRow?.quantity).toBe(1);
+    });
+  });
+});

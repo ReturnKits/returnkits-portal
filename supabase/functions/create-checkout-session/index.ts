@@ -268,6 +268,7 @@ async function handleRequest(req: Request): Promise<Response> {
     // session.amount_total before anything is written — see the "Defence
     // in depth" comment there.
     metadata: {
+      type: "order_payment",
       company_id: companyId,
       order_ids: orderIds.join(","),
       subtotal_ex_vat_pence: String(subtotalExVatPence),
