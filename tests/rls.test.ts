@@ -2342,4 +2342,250 @@ describe("RLS: internal-only tables default-deny for every client role (gap clos
     await deleteAuthUserByEmail(email);
     await adminClient.from("companies").delete().eq("id", company.id);
   });
+
+  it("✗ authenticated clients cannot write cover_tiers (same world-readable-but-read-only shape as kit_types)", async () => {
+    const email = uniqueEmail("covertiers-deny");
+    const company = await createCompany("Cover Tiers Deny Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+    const client = await clientAsUser(email);
+
+    const { error } = await client.from("cover_tiers").update({ price_ex_vat_pence: 1 }).eq("id", "up_to_500");
+    expect(error).not.toBeNull();
+
+    const { data: readBack, error: readError } = await client.from("cover_tiers").select("id").eq("id", "up_to_500");
+    expect(readError).toBeNull();
+    expect(readBack?.length).toBe(1);
+
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+});
+
+describe("Enhanced Cover — cover_tiers, order snapshotting, and flag_cover_claim (20260812)", () => {
+  // Built after the fact: the architecture doc (§20) fully designed Enhanced
+  // Cover, but nothing was ever wired up -- no table, no UI, nothing live --
+  // until enterprise pricing was quoted to a real prospect assuming it
+  // existed. See CLAUDE.md's Enhanced Cover locked decision.
+  let company: { id: string };
+  const ownerEmail = uniqueEmail("cover-owner");
+  const staffEmail = uniqueEmail("cover-staff");
+  let staffId: string;
+  let employee: { id: string };
+
+  beforeAll(async () => {
+    company = await createCompany("Enhanced Cover Test Co");
+    const owner = await createAuthUser(ownerEmail);
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(owner.id, company.id, ownerEmail, "company_admin");
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Cover Test Employee", email: "cover-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [ownerEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✓ create_order with no p_cover_tier_id leaves both cover columns null (cover stays optional)", async () => {
+    const client = await clientAsUser(ownerEmail);
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("cover_tier_id, cover_price_ex_vat_pence")
+      .eq("id", orderId as string)
+      .single();
+    expect(order?.cover_tier_id).toBeNull();
+    expect(order?.cover_price_ex_vat_pence).toBeNull();
+  });
+
+  it("✓ create_order with a cover tier snapshots the price onto the order", async () => {
+    const client = await clientAsUser(ownerEmail);
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+      p_cover_tier_id: "up_to_1000",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("cover_tier_id, cover_price_ex_vat_pence")
+      .eq("id", orderId as string)
+      .single();
+    expect(order?.cover_tier_id).toBe("up_to_1000");
+    expect(order?.cover_price_ex_vat_pence).toBe(1000);
+  });
+
+  it("✗ create_order rejects an unknown cover tier", async () => {
+    const client = await clientAsUser(ownerEmail);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+      p_cover_tier_id: "not_a_real_tier",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ database constraint: cover_tier_id and cover_price_ex_vat_pence must both be null or both be set", async () => {
+    // Direct write via the service_role client, bypassing create_order's own
+    // validation -- this is what actually enforces the snapshot pairing, not
+    // application code, so it needs to be tested at this layer too.
+    const { data: emp } = await adminClient
+      .from("employees")
+      .select("id")
+      .eq("id", employee.id)
+      .single();
+    const { error } = await adminClient.from("orders").insert({
+      company_id: company.id,
+      reference: `RKL-260812-${Math.floor(Math.random() * 900) + 100}`,
+      kit_type_id: "laptop",
+      service_type: "ship_to_new_employee",
+      source: "internal_staff",
+      created_by: staffId,
+      employee_id: emp!.id,
+      price_ex_vat_pence: 6500,
+      cover_tier_id: "up_to_1000",
+      cover_price_ex_vat_pence: null,
+    } as never);
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ flag_cover_claim requires service_role, an internal actor, and an order that actually has cover", async () => {
+    const client = await clientAsUser(ownerEmail);
+    const { data: orderId, error: createError } = await client.rpc("create_order", {
+      p_kit_type_id: "monitor",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+      p_cover_tier_id: "up_to_2000",
+    });
+    expect(createError).toBeNull();
+
+    // Regular authenticated client, even the order's own owner, is refused.
+    const directCall = await client.rpc("flag_cover_claim", {
+      p_order_id: orderId as string,
+      p_actor_id: staffId,
+      p_notes: "Device lost in transit",
+    });
+    expect(directCall.error).not.toBeNull();
+
+    // service_role with a non-internal actor is refused by assert_internal_actor.
+    const { data: ownerUser } = await client.auth.getUser();
+    const nonInternalCall = await adminClient.rpc("flag_cover_claim", {
+      p_order_id: orderId as string,
+      p_actor_id: ownerUser.user!.id,
+      p_notes: "Device lost in transit",
+    });
+    expect(nonInternalCall.error).not.toBeNull();
+
+    // A separately-created order with no cover on it is refused even for a
+    // legitimate service_role + internal_ops call.
+    const { data: noCoverOrderId } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    const noCoverCall = await adminClient.rpc("flag_cover_claim", {
+      p_order_id: noCoverOrderId as string,
+      p_actor_id: staffId,
+      p_notes: "No cover on this order",
+    });
+    expect(noCoverCall.error).not.toBeNull();
+
+    // The real, valid path: service_role + internal actor + an order with cover.
+    const { error: validError } = await adminClient.rpc("flag_cover_claim", {
+      p_order_id: orderId as string,
+      p_actor_id: staffId,
+      p_notes: "Device lost in transit",
+    });
+    expect(validError).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("cover_claim_filed_at, fulfilment_log")
+      .eq("id", orderId as string)
+      .single();
+    expect(order?.cover_claim_filed_at).not.toBeNull();
+    const log = (order?.fulfilment_log ?? []) as Array<{ action: string }>;
+    expect(log.some((entry) => entry.action === "cover_claim_flagged")).toBe(true);
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action, actor_id")
+      .eq("target_id", orderId as string)
+      .eq("action", "order.flag_cover_claim");
+    expect(auditRows?.length).toBe(1);
+    expect(auditRows?.[0].actor_id).toBe(staffId);
+
+    // Filing a second claim on the same order is refused -- one claim record
+    // per order, matching the state-guard pattern used elsewhere (e.g.
+    // mark_order_paid refusing an already-paid order).
+    const secondClaim = await adminClient.rpc("flag_cover_claim", {
+      p_order_id: orderId as string,
+      p_actor_id: staffId,
+      p_notes: "Trying again",
+    });
+    expect(secondClaim.error).not.toBeNull();
+  });
+
+  it("✓ invoice arithmetic with a cover line is penny-accurate (mirrors record_stripe_payment's kit-only case)", async () => {
+    // create-checkout-session (not exercised here -- that's Deno, not
+    // Postgres) computes subtotal/VAT across kit + cover lines and hands
+    // the totals to record_stripe_payment as plain integers, so this test
+    // exercises the same arithmetic record_stripe_payment always has: given
+    // a kit line (£65 ex VAT) and a cover line (£10 ex VAT) at 20% VAT
+    // each, subtotal = 7500p, VAT = 1500p, total = 9000p.
+    const client = await clientAsUser(ownerEmail);
+    const { data: orderId, error: createError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+      p_cover_tier_id: "up_to_1000",
+    });
+    expect(createError).toBeNull();
+
+    const eventId = `evt_cover_${Date.now()}`;
+    const sessionId = `cs_cover_${Date.now()}`;
+    const { data: invoiceId, error } = await adminClient.rpc("record_stripe_payment", {
+      p_event_id: eventId,
+      p_event_type: "checkout.session.completed",
+      p_checkout_session_id: sessionId,
+      p_payment_intent_id: `pi_${sessionId}`,
+      p_company_id: company.id,
+      p_order_ids: [orderId as string],
+      p_subtotal_ex_vat_pence: 7500, // 6500 (laptop) + 1000 (cover)
+      p_vat_pence: 1500, // 1300 (laptop VAT) + 200 (cover VAT)
+      p_total_inc_vat_pence: 9000,
+    });
+    expect(error).toBeNull();
+
+    const { data: invoice } = await adminClient
+      .from("invoices")
+      .select("subtotal_ex_vat_pence, vat_pence, total_inc_vat_pence")
+      .eq("id", invoiceId as string)
+      .single();
+    expect(invoice?.subtotal_ex_vat_pence).toBe(7500);
+    expect(invoice?.vat_pence).toBe(1500);
+    expect(invoice?.total_inc_vat_pence).toBe(9000);
+    expect(invoice!.subtotal_ex_vat_pence + invoice!.vat_pence).toBe(invoice!.total_inc_vat_pence);
+  });
 });

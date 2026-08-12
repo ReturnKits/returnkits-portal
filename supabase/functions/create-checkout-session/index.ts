@@ -18,6 +18,13 @@
 // out, or the customer just closes the tab, nothing in our database has
 // changed: no order, invoice, or payment_status write happens here.
 //
+// Enhanced Cover (20260812): if an order has cover_tier_id set, it gets its
+// own Stripe line item alongside the kit line -- never folded into the kit
+// price -- so the invoice breakdown always shows kit and cover separately
+// (architecture §20's worked example). Cover VAT comes from cover_tiers'
+// own vat_rate column, same reasoning as kit_types.vat_rate: an
+// accountant's ruling changes data, not code.
+//
 // Required secrets: STRIPE_SECRET_KEY (sk_test_... while in test mode).
 // SUPABASE_URL / SUPABASE_ANON_KEY are provided automatically.
 
@@ -53,7 +60,19 @@ type OrderRow = {
   company_id: string;
   price_ex_vat_pence: number;
   payment_status: string;
+  cover_tier_id: string | null;
+  cover_price_ex_vat_pence: number | null;
   kit_types: { label: string; vat_rate: string | number } | null;
+  cover_tiers: { label: string; vat_rate: string | number } | null;
+};
+
+type StripeLineItem = {
+  price_data: {
+    currency: string;
+    product_data: { name: string };
+    unit_amount: number;
+  };
+  quantity: number;
 };
 
 Deno.serve(async (req: Request) => {
@@ -116,7 +135,10 @@ async function handleRequest(req: Request): Promise<Response> {
 
   const { data: orders, error: ordersError } = await userClient
     .from("orders")
-    .select("id, company_id, price_ex_vat_pence, payment_status, kit_types(label, vat_rate)")
+    .select(
+      "id, company_id, price_ex_vat_pence, payment_status, cover_tier_id, cover_price_ex_vat_pence, " +
+        "kit_types(label, vat_rate), cover_tiers(label, vat_rate)",
+    )
     .in("id", orderIds)
     .returns<OrderRow[]>();
 
@@ -155,17 +177,22 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // Integer pence throughout (CLAUDE.md rule 5). VAT computed per order and
+  // Integer pence throughout (CLAUDE.md rule 5). VAT computed per line and
   // summed, not computed once off the summed subtotal — keeps rounding
-  // local to each line the way the invoice will ultimately show it.
+  // local to each line the way the invoice will ultimately show it. Cover
+  // is deliberately its own line, never folded into the kit price/line —
+  // architecture §20's worked example shows kit and cover as separate
+  // invoice lines under one VAT total.
   let subtotalExVatPence = 0;
   let vatPence = 0;
-  const lineItems = orders.map((order) => {
-    const vatRate = Number(order.kit_types?.vat_rate ?? 0.2);
-    const lineVatPence = Math.round(order.price_ex_vat_pence * vatRate);
+  const lineItems: StripeLineItem[] = [];
+
+  for (const order of orders) {
+    const kitVatRate = Number(order.kit_types?.vat_rate ?? 0.2);
+    const kitVatPence = Math.round(order.price_ex_vat_pence * kitVatRate);
     subtotalExVatPence += order.price_ex_vat_pence;
-    vatPence += lineVatPence;
-    return {
+    vatPence += kitVatPence;
+    lineItems.push({
       price_data: {
         currency: "gbp",
         product_data: { name: order.kit_types?.label ?? "ReturnKits kit" },
@@ -173,11 +200,26 @@ async function handleRequest(req: Request): Promise<Response> {
         // "charge the inc-VAT total, with VAT as a separate line so
         // Stripe's records match your invoices"); the ex-VAT/VAT split
         // itself is tracked in our own invoices table, not in Stripe.
-        unit_amount: order.price_ex_vat_pence + lineVatPence,
+        unit_amount: order.price_ex_vat_pence + kitVatPence,
       },
       quantity: 1,
-    };
-  });
+    });
+
+    if (order.cover_tier_id && order.cover_price_ex_vat_pence != null) {
+      const coverVatRate = Number(order.cover_tiers?.vat_rate ?? 0.2);
+      const coverVatPence = Math.round(order.cover_price_ex_vat_pence * coverVatRate);
+      subtotalExVatPence += order.cover_price_ex_vat_pence;
+      vatPence += coverVatPence;
+      lineItems.push({
+        price_data: {
+          currency: "gbp",
+          product_data: { name: order.cover_tiers?.label ?? "Enhanced Cover" },
+          unit_amount: order.cover_price_ex_vat_pence + coverVatPence,
+        },
+        quantity: 1,
+      });
+    }
+  }
   const totalIncVatPence = subtotalExVatPence + vatPence;
 
   // Look up (or create) a Stripe Customer for this company, so repeat
