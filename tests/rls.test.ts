@@ -588,6 +588,120 @@ describe("RLS: public.orders — isolation, collaboration, and create_order()", 
     const { data } = await adminClient.from("orders").select("notify_employee").eq("id", orderId as string).single();
     expect(data?.notify_employee).toBe(true);
   });
+
+  // 20260813: manual, one-off employee entry. The orderer can type a
+  // recipient's name/address directly into the New Order form instead of
+  // picking from the employees directory -- explicitly NOT written to
+  // public.employees, only snapshotted onto the order itself via
+  // employee_name/employee_email/employee_address_line1 etc.
+  // orders_employee_source_check enforces exactly one of employee_id /
+  // employee_name is ever set (never both, never neither).
+  it("the standard employee_id path leaves employee_name null (source check sanity)", async () => {
+    // orderAId (from beforeAll) was created via p_employee_id, no manual fields.
+    const { data } = await adminClient
+      .from("orders")
+      .select("employee_id, employee_name")
+      .eq("id", orderAId)
+      .single();
+    expect(data?.employee_id).toBe(employeeA.id);
+    expect(data?.employee_name).toBeNull();
+  });
+
+  it("create_order() with manual employee details creates an order with null employee_id and populated snapshot columns", async () => {
+    const client = await clientAsUser(a1Email);
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_name: "Casey One-Off",
+      p_employee_email: "casey@example.com",
+      p_employee_address_line1: "12 Test Street",
+      p_employee_city: "Leeds",
+      p_employee_postcode: "LS1 1AA",
+    });
+    expect(error).toBeNull();
+
+    const { data } = await adminClient
+      .from("orders")
+      .select("employee_id, employee_name, employee_email, employee_address_line1, employee_city, employee_postcode, employee_country")
+      .eq("id", orderId as string)
+      .single();
+    expect(data?.employee_id).toBeNull();
+    expect(data?.employee_name).toBe("Casey One-Off");
+    expect(data?.employee_email).toBe("casey@example.com");
+    expect(data?.employee_address_line1).toBe("12 Test Street");
+    expect(data?.employee_city).toBe("Leeds");
+    expect(data?.employee_postcode).toBe("LS1 1AA");
+    // country defaults to 'GB' when the manual path is used and no country was passed.
+    expect(data?.employee_country).toBe("GB");
+
+    // And confirms nothing leaked into the employees directory -- manual
+    // entry is explicitly one-off, never persisted as a reusable row.
+    const { data: directoryMatch } = await adminClient
+      .from("employees")
+      .select("id")
+      .eq("company_id", companyA.id)
+      .eq("full_name", "Casey One-Off");
+    expect(directoryMatch).toEqual([]);
+  });
+
+  it("✗ create_order() rejects providing both p_employee_id and p_employee_name", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+      p_employee_name: "Ambiguous Person",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ create_order() rejects providing neither an employee_id nor employee_name", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ create_order() rejects a blank manual employee name", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_name: "   ",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ orders_employee_source_check rejects a direct insert with both employee_id and employee_name set", async () => {
+    // Bypasses the RPC entirely (service_role, same as the RPC's own INSERT)
+    // to prove the DB-level constraint itself is the real backstop, not
+    // just the RPC's application-level validation above.
+    const { error } = await adminClient.from("orders").insert({
+      company_id: companyA.id,
+      reference: "RKL-260813-901",
+      kit_type_id: "phone",
+      service_type: "ship_to_new_employee",
+      source: "internal_staff",
+      employee_id: employeeA.id,
+      employee_name: "Both Set",
+      price_ex_vat_pence: 4000,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ orders_employee_source_check rejects a direct insert with neither employee_id nor employee_name set", async () => {
+    const { error } = await adminClient.from("orders").insert({
+      company_id: companyA.id,
+      reference: "RKL-260813-902",
+      kit_type_id: "phone",
+      service_type: "ship_to_new_employee",
+      source: "internal_staff",
+      price_ex_vat_pence: 4000,
+    });
+    expect(error).not.toBeNull();
+  });
 });
 
 describe("RLS: public.invoices — isolation, collaboration, and client write protection (Phase 3)", () => {
@@ -1116,6 +1230,40 @@ describe("mark_order_dispatched() / create_internal_order() — the Retool write
       .eq("id", optInOrderId as string)
       .single();
     expect(optInOrder?.notify_employee).toBe(true);
+  });
+
+  it("create_internal_order() also accepts manual employee details (20260813), same as create_order()", async () => {
+    const { data: orderId, error } = await adminClient.rpc("create_internal_order", {
+      p_company_id: company.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "monitor",
+      p_service_type: "ship_to_new_employee",
+      p_employee_name: "Retool One-Off",
+      p_employee_postcode: "SW1A 1AA",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("employee_id, employee_name, employee_postcode, employee_country")
+      .eq("id", orderId as string)
+      .single();
+    expect(order?.employee_id).toBeNull();
+    expect(order?.employee_name).toBe("Retool One-Off");
+    expect(order?.employee_postcode).toBe("SW1A 1AA");
+    expect(order?.employee_country).toBe("GB");
+  });
+
+  it("✗ create_internal_order() rejects providing both p_employee_id and p_employee_name", async () => {
+    const { error } = await adminClient.rpc("create_internal_order", {
+      p_company_id: company.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "monitor",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+      p_employee_name: "Ambiguous",
+    });
+    expect(error).not.toBeNull();
   });
 });
 

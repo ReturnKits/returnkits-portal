@@ -181,6 +181,43 @@ function formatAddressLine(line1: string | null, line2: string | null, city: str
     .join(", ");
 }
 
+// Resolves employee name/email/address from EITHER a joined employees row
+// OR the order-level manual-entry snapshot columns (20260813:
+// orders.employee_name etc., used when the orderer typed a one-off
+// recipient instead of picking from the directory -- orders_employee_source_check
+// guarantees exactly one of the two is populated, never both, never
+// neither). Every call site that used to read o.employees.* directly now
+// goes through this so the manual path and the directory path render
+// identically.
+type EmployeeSource = {
+  employees: { full_name: string; email: string | null; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
+  employee_name: string | null;
+  employee_email: string | null;
+  employee_address_line1: string | null;
+  employee_address_line2: string | null;
+  employee_city: string | null;
+  employee_postcode: string | null;
+  employee_country: string | null;
+};
+
+function resolveEmployee(o: EmployeeSource): { name: string | null; email: string | null; addressLine: string } {
+  if (o.employees) {
+    return {
+      name: o.employees.full_name,
+      email: o.employees.email,
+      addressLine: formatAddressLine(o.employees.address_line1, o.employees.address_line2, o.employees.city, o.employees.postcode),
+    };
+  }
+  if (o.employee_name) {
+    return {
+      name: o.employee_name,
+      email: o.employee_email,
+      addressLine: formatAddressLine(o.employee_address_line1, o.employee_address_line2, o.employee_city, o.employee_postcode),
+    };
+  }
+  return { name: null, email: null, addressLine: "" };
+}
+
 // ---- Shared layout ----------------------------------------------------
 
 // Hosted in the public brand-assets Storage bucket (uploaded once via the
@@ -718,6 +755,7 @@ async function handleRequest(req: Request): Promise<Response> {
     .select(
       `id, reference, bundle_id, service_type, price_ex_vat_pence, created_by, created_at, return_address_id,
        outbound_courier, outbound_tracking_number, outbound_tracking_url, employee_id, notify_employee,
+       employee_name, employee_email, employee_address_line1, employee_address_line2, employee_city, employee_postcode, employee_country,
        company:companies(id, name), kit_types(label),
        employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
     )
@@ -740,8 +778,15 @@ async function handleRequest(req: Request): Promise<Response> {
     outbound_courier: string | null;
     outbound_tracking_number: string | null;
     outbound_tracking_url: string | null;
-    employee_id: string;
+    employee_id: string | null;
     notify_employee: boolean;
+    employee_name: string | null;
+    employee_email: string | null;
+    employee_address_line1: string | null;
+    employee_address_line2: string | null;
+    employee_city: string | null;
+    employee_postcode: string | null;
+    employee_country: string | null;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
     employees: { full_name: string; email: string | null; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
@@ -751,9 +796,8 @@ async function handleRequest(req: Request): Promise<Response> {
     return new Response(JSON.stringify({ error: "Order has no company" }), { status: 500 });
   }
 
-  const employeeAddress = o.employees
-    ? formatAddressLine(o.employees.address_line1, o.employees.address_line2, o.employees.city, o.employees.postcode)
-    : null;
+  const resolvedEmployee = resolveEmployee(o);
+  const employeeAddress = resolvedEmployee.addressLine || null;
 
   // notification_preferences gate (architecture §5: checked before every send)
   const { data: enabled } = await supabase.rpc("notification_enabled", {
@@ -782,7 +826,7 @@ async function handleRequest(req: Request): Promise<Response> {
       kitLabel: o.kit_types?.label ?? "Kit",
       serviceType: o.service_type,
       priceExVatPence: o.price_ex_vat_pence,
-      employeeName: o.employees?.full_name ?? null,
+      employeeName: resolvedEmployee.name,
       employeeAddress,
     },
   ];
@@ -796,7 +840,9 @@ async function handleRequest(req: Request): Promise<Response> {
     const { data: siblings } = await supabase
       .from("orders")
       .select(
-        "id, reference, service_type, price_ex_vat_pence, return_address_id, created_at, kit_types(label), employees(full_name, address_line1, address_line2, city, postcode, country)",
+        `id, reference, service_type, price_ex_vat_pence, return_address_id, created_at, kit_types(label),
+         employee_name, employee_email, employee_address_line1, employee_address_line2, employee_city, employee_postcode, employee_country,
+         employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
       )
       .eq("bundle_id", o.bundle_id)
       .order("created_at", { ascending: true });
@@ -804,14 +850,14 @@ async function handleRequest(req: Request): Promise<Response> {
     if (siblings && siblings.length > 0) {
       siblingOrderIds = siblings.map((s) => s.id as string);
       confirmationLines = siblings.map((s) => {
-        const emp = (s as unknown as { employees: { full_name: string; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null } | null }).employees;
+        const resolved = resolveEmployee(s as unknown as EmployeeSource);
         return {
           reference: s.reference as string,
           kitLabel: (s as unknown as { kit_types: { label: string } | null }).kit_types?.label ?? "Kit",
           serviceType: s.service_type as string,
           priceExVatPence: s.price_ex_vat_pence as number,
-          employeeName: emp?.full_name ?? null,
-          employeeAddress: emp ? formatAddressLine(emp.address_line1, emp.address_line2, emp.city, emp.postcode) : null,
+          employeeName: resolved.name,
+          employeeAddress: resolved.addressLine || null,
         };
       });
       const withReturnAddress = siblings.find((s) => s.return_address_id);
@@ -880,7 +926,7 @@ async function handleRequest(req: Request): Promise<Response> {
       courier: o.outbound_courier ?? "Courier",
       trackingNumber: o.outbound_tracking_number ?? "—",
       trackingUrl: o.outbound_tracking_url,
-      employeeName: o.employees?.full_name ?? null,
+      employeeName: resolvedEmployee.name,
       employeeAddress,
     });
   } else if (type === "checkin_sent") {
@@ -937,8 +983,8 @@ async function handleRequest(req: Request): Promise<Response> {
   await sendEmployeeCopy({
     type,
     order: { id: o.id, service_type: o.service_type, company: o.company },
-    employeeEmail: o.employees?.email ?? null,
-    employeeName: o.employees?.full_name ?? null,
+    employeeEmail: resolvedEmployee.email,
+    employeeName: resolvedEmployee.name,
     courier: o.outbound_courier,
     trackingUrl: o.outbound_tracking_url,
     notifyEmployee: o.notify_employee,

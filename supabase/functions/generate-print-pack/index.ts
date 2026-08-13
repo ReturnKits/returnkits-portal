@@ -24,7 +24,81 @@
 
 import { PDFDocument, StandardFonts, rgb } from "npm:pdf-lib@1.17.1";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { captureError } from "../_shared/sentry.ts";
+
+// Inlined from ../_shared/sentry.ts (20260813, same fix applied to
+// send-order-email): the deploy_edge_function MCP tool wasn't reliably
+// bundling cross-function relative imports on a recent redeploy of a
+// sibling function, even with the shared file included in the payload.
+// This function had deployed fine with the shared import before, but
+// inlining here too removes the risk on this redeploy rather than gambling
+// on it working again. Content is otherwise identical to
+// supabase/functions/_shared/sentry.ts.
+const SENTRY_DSN = Deno.env.get("SENTRY_DSN");
+
+function parseDsn(dsn: string): { host: string; projectId: string; publicKey: string } | null {
+  try {
+    const url = new URL(dsn);
+    const publicKey = url.username;
+    const projectId = url.pathname.replace(/^\//, "");
+    if (!publicKey || !projectId) return null;
+    return { host: url.host, projectId, publicKey };
+  } catch {
+    return null;
+  }
+}
+
+const sentryParsed = SENTRY_DSN ? parseDsn(SENTRY_DSN) : null;
+
+function sentryEventId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function captureError(
+  err: unknown,
+  context: { function: string; [key: string]: unknown } = { function: "unknown" },
+): void {
+  console.error(`[${context.function}]`, err);
+  if (!sentryParsed) return;
+
+  const error = err instanceof Error ? err : new Error(typeof err === "string" ? err : JSON.stringify(err));
+  const { function: fnName, ...extra } = context;
+
+  const event = {
+    event_id: sentryEventId(),
+    timestamp: new Date().toISOString(),
+    platform: "other",
+    level: "error",
+    logger: "edge-function",
+    server_name: fnName,
+    environment: Deno.env.get("SENTRY_ENVIRONMENT") ?? "production",
+    tags: { function: fnName },
+    extra,
+    exception: {
+      values: [
+        {
+          type: error.name || "Error",
+          value: error.message,
+          stacktrace: error.stack
+            ? { frames: error.stack.split("\n").map((line) => ({ filename: line.trim() })) }
+            : undefined,
+        },
+      ],
+    },
+  };
+
+  const endpoint = `https://${sentryParsed.host}/api/${sentryParsed.projectId}/store/`;
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Sentry-Auth": `Sentry sentry_version=7, sentry_key=${sentryParsed.publicKey}, sentry_client=returnkits-edge/1.0`,
+    },
+    body: JSON.stringify(event),
+  }).catch((sentryErr) => {
+    console.error(`[${fnName}] failed to report to Sentry:`, sentryErr);
+  });
+}
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -39,6 +113,54 @@ const SIGNED_URL_TTL_SECONDS = 60 * 60; // 1 hour -- long enough for staff to op
 
 function formatAddress(parts: Array<string | null | undefined>): string[] {
   return parts.filter((part): part is string => Boolean(part && part.trim()));
+}
+
+// Resolves the "ship to" name + address lines from EITHER the joined
+// employees row OR the order-level manual-entry snapshot columns
+// (20260813: orders.employee_name etc., populated when the orderer typed a
+// one-off recipient in Lovable instead of picking from the directory).
+// orders_employee_source_check guarantees exactly one of the two is
+// populated. Mirrors send-order-email's resolveEmployee() so both
+// consumers of employee data treat the manual path identically.
+type EmployeeSource = {
+  employees: {
+    full_name: string;
+    address_line1: string | null;
+    address_line2: string | null;
+    city: string | null;
+    postcode: string | null;
+    country: string | null;
+  } | null;
+  employee_name: string | null;
+  employee_address_line1: string | null;
+  employee_address_line2: string | null;
+  employee_city: string | null;
+  employee_postcode: string | null;
+  employee_country: string | null;
+};
+
+function resolveEmployeeAddressLines(o: EmployeeSource): string[] {
+  if (o.employees) {
+    return formatAddress([
+      o.employees.full_name,
+      o.employees.address_line1,
+      o.employees.address_line2,
+      o.employees.city,
+      o.employees.postcode,
+      o.employees.country,
+    ]);
+  }
+  if (o.employee_name) {
+    return formatAddress([
+      o.employee_name,
+      o.employee_address_line1,
+      o.employee_address_line2,
+      o.employee_city,
+      o.employee_postcode,
+      o.employee_country,
+    ]);
+  }
+  return [];
 }
 
 Deno.serve(async (req: Request) => {
@@ -96,6 +218,7 @@ async function handleRequest(req: Request): Promise<Response> {
        company:companies(name),
        kit_types(label),
        employees(full_name, address_line1, address_line2, city, postcode, country),
+       employee_name, employee_address_line1, employee_address_line2, employee_city, employee_postcode, employee_country,
        return_address:addresses!orders_return_address_id_fkey(label, address_line1, address_line2, city, postcode, country)`,
     )
     .eq("id", orderId)
@@ -121,6 +244,12 @@ async function handleRequest(req: Request): Promise<Response> {
       postcode: string | null;
       country: string | null;
     } | null;
+    employee_name: string | null;
+    employee_address_line1: string | null;
+    employee_address_line2: string | null;
+    employee_city: string | null;
+    employee_postcode: string | null;
+    employee_country: string | null;
     return_address: {
       label: string;
       address_line1: string;
@@ -180,16 +309,8 @@ async function handleRequest(req: Request): Promise<Response> {
     drawLine("prepaid return label before dropping off with the carrier.", { size: 10, gap: 14, color: [0.3, 0.3, 0.3] });
   } else {
     drawLine("Ship to:", { useBold: true, gap: 20 });
-    const addressLines = o.employees
-      ? formatAddress([
-          o.employees.full_name,
-          o.employees.address_line1,
-          o.employees.address_line2,
-          o.employees.city,
-          o.employees.postcode,
-          o.employees.country,
-        ])
-      : ["No recipient address on file."];
+    const resolvedLines = resolveEmployeeAddressLines(o);
+    const addressLines = resolvedLines.length > 0 ? resolvedLines : ["No recipient address on file."];
     for (const line of addressLines) drawLine(line, { gap: 16 });
   }
 
