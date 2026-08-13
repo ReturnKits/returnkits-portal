@@ -2589,11 +2589,17 @@ describe("RLS: public.companies — isolation, collaboration, and admin-only upd
 
   it("✗ a company_member (not admin) cannot update their own company", async () => {
     const client = await clientAsUser(memberEmail);
+    // `count` must be passed to update() itself, not to the trailing
+    // select() -- PostgrestTransformBuilder.select() (the overload used
+    // after insert/update/delete) only accepts a columns string, no options
+    // object, so { count: "exact" } chained onto .select() is silently
+    // dropped and count comes back null. See node_modules/@supabase/postgrest-js
+    // PostgrestQueryBuilder.update()'s second `{ count }` param instead.
     const { error, count } = await client
       .from("companies")
-      .update({ billing_email: "should-not-land@company-a-test.invalid" })
+      .update({ billing_email: "should-not-land@company-a-test.invalid" }, { count: "exact" })
       .eq("id", companyA.id)
-      .select("id", { count: "exact" });
+      .select("id");
     // RLS silently filters the row out of the UPDATE's WHERE match rather
     // than erroring -- zero rows affected is the assertion, same shape as
     // the client-supplied-company_id-override tests elsewhere in this file.
@@ -2605,9 +2611,9 @@ describe("RLS: public.companies — isolation, collaboration, and admin-only upd
     const client = await clientAsUser(bEmail);
     const { error, count } = await client
       .from("companies")
-      .update({ billing_email: "cross-tenant@company-a-test.invalid" })
+      .update({ billing_email: "cross-tenant@company-a-test.invalid" }, { count: "exact" })
       .eq("id", companyA.id)
-      .select("id", { count: "exact" });
+      .select("id");
     expect(error).toBeNull();
     expect(count).toBe(0);
   });
@@ -2677,11 +2683,13 @@ describe("RLS: public.users update — profile fields for the Settings page (202
 
   it("✗ a company_member (not admin) cannot update even their own profile fields", async () => {
     const client = await clientAsUser(memberEmail);
+    // See the companies-RLS block above: count belongs on update()'s own
+    // options, not on the trailing select() -- that overload silently drops it.
     const { error, count } = await client
       .from("users")
-      .update({ full_name: "Should Not Land" })
+      .update({ full_name: "Should Not Land" }, { count: "exact" })
       .eq("email", memberEmail)
-      .select("id", { count: "exact" });
+      .select("id");
     expect(error).toBeNull();
     expect(count).toBe(0);
   });
@@ -2690,9 +2698,9 @@ describe("RLS: public.users update — profile fields for the Settings page (202
     const client = await clientAsUser(bAdminEmail);
     const { error, count } = await client
       .from("users")
-      .update({ full_name: "Cross Tenant" })
+      .update({ full_name: "Cross Tenant" }, { count: "exact" })
       .eq("email", adminEmail)
-      .select("id", { count: "exact" });
+      .select("id");
     expect(error).toBeNull();
     expect(count).toBe(0);
   });
@@ -2870,14 +2878,31 @@ describe("RLS: internal-only tables default-deny for every client role (gap clos
     await createProfile(user.id, company.id, email, "company_admin");
     const client = await clientAsUser(email);
 
-    const { error } = await client.from("kit_types").update({ price_ex_vat_pence: 1 }).eq("id", "laptop");
-    expect(error).not.toBeNull();
+    // Supabase's default schema privileges grant UPDATE on every public
+    // table to `authenticated` -- RLS is the actual gate. With zero UPDATE
+    // policies on kit_types, the statement itself succeeds (no SQL-level
+    // permission error) but RLS filters every row out of the match, so
+    // zero rows are affected. Same "silently filtered, not erroring" shape
+    // as the companies/users update tests above -- assert on count, not on
+    // error, and remember count must be passed to update() itself, not the
+    // trailing select().
+    const { error, count } = await client
+      .from("kit_types")
+      .update({ price_ex_vat_pence: 1 }, { count: "exact" })
+      .eq("id", "laptop")
+      .select("id");
+    expect(error).toBeNull();
+    expect(count).toBe(0);
 
     // Confirm the world-readable side still works -- this table SHOULD be
     // selectable by everyone, only writes should be blocked.
     const { data: readBack, error: readError } = await client.from("kit_types").select("id").eq("id", "laptop");
     expect(readError).toBeNull();
     expect(readBack?.length).toBe(1);
+
+    // And confirm the price genuinely didn't change.
+    const { data: unchanged } = await adminClient.from("kit_types").select("price_ex_vat_pence").eq("id", "laptop").single();
+    expect(unchanged?.price_ex_vat_pence).not.toBe(1);
 
     await deleteAuthUserByEmail(email);
     await adminClient.from("companies").delete().eq("id", company.id);
@@ -2890,12 +2915,27 @@ describe("RLS: internal-only tables default-deny for every client role (gap clos
     await createProfile(user.id, company.id, email, "company_admin");
     const client = await clientAsUser(email);
 
-    const { error } = await client.from("cover_tiers").update({ price_ex_vat_pence: 1 }).eq("id", "up_to_500");
-    expect(error).not.toBeNull();
+    // Same shape as the kit_types test above: the UPDATE is permitted at
+    // the SQL grant level, RLS filters out every row (zero policies), so
+    // it succeeds with zero rows affected rather than erroring.
+    const { error, count } = await client
+      .from("cover_tiers")
+      .update({ price_ex_vat_pence: 1 }, { count: "exact" })
+      .eq("id", "up_to_500")
+      .select("id");
+    expect(error).toBeNull();
+    expect(count).toBe(0);
 
     const { data: readBack, error: readError } = await client.from("cover_tiers").select("id").eq("id", "up_to_500");
     expect(readError).toBeNull();
     expect(readBack?.length).toBe(1);
+
+    const { data: unchanged } = await adminClient
+      .from("cover_tiers")
+      .select("price_ex_vat_pence")
+      .eq("id", "up_to_500")
+      .single();
+    expect(unchanged?.price_ex_vat_pence).not.toBe(1);
 
     await deleteAuthUserByEmail(email);
     await adminClient.from("companies").delete().eq("id", company.id);
