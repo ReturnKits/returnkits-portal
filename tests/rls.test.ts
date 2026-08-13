@@ -1888,6 +1888,235 @@ describe("apply_sendcloud_tracking_event() / delivered -> completed (20260813)",
   });
 });
 
+describe("apply_sendcloud_poll_result() — 'Check Tracking Now' pull fallback (20260813)", () => {
+  // The poll-path counterpart to apply_sendcloud_tracking_event(), added
+  // after live-testing found sendcloud_webhook_events sits at zero rows --
+  // no webhook has ever actually reached this system. See migration
+  // 20260813200000_sendcloud_poll_fallback.sql. Looked up by order_id
+  // (not a tracking-number scan), staff-actor-attributed (never a null
+  // actor_id like the webhook path), and keyed off
+  // sendcloud_poll_status_map's parent_status vocabulary, not
+  // sendcloud_status_map's status_code vocabulary -- confirmed via source
+  // to be genuinely different API surfaces, not a naming variant of the
+  // same thing.
+  let company: { id: string };
+  const custEmail = uniqueEmail("p6-poll-cust");
+  const staffEmail = uniqueEmail("p6-poll-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let shipOrderId: string;
+  let returnOrderId: string;
+  const shipTracking = `POLLSHIP-${Date.now()}`;
+  const returnTracking = `POLLRET-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Phase6 Poll Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Poll Test", email: "poll@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(custEmail);
+
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (shipError) throw shipError;
+    shipOrderId = shipId as string;
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: (addr as { id: string }).id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: shipTracking })
+      .eq("id", shipOrderId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", return_tracking_number: returnTracking })
+      .eq("id", returnOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a regular authenticated customer cannot call apply_sendcloud_poll_result", async () => {
+    const client = await clientAsUser(custEmail);
+    const { error } = await client.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ a stale tracking number (no longer on the order) is acknowledged as unmatched, not applied", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: "SOME-OTHER-NUMBER-NOT-ON-THIS-ORDER",
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.matched).toBe(false);
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+    expect(order?.fulfilment_status).toBe("dispatched"); // unchanged
+  });
+
+  it("✓ an unmapped parent_status is a no-op, not an error", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "some_totally_unknown_parent_status",
+      p_status_description: "Unrecognised",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.matched).toBe(true);
+    expect(data?.applied).toBe(false);
+  });
+
+  it("✓ a mapped 'shipment-on-route' poll result transitions dispatched -> in_transit, actor-attributed", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.new_status).toBe("in_transit");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", shipOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("in_transit");
+    const log = order?.fulfilment_log as Array<{ action: string; actor_id: string | null; detail: { source?: string } }>;
+    const entry = log.find((e) => e.action === "in_transit");
+    // Actor-attributed, never null -- distinguishes a staff-triggered poll
+    // from the webhook path's system-triggered (null actor_id) entries.
+    expect(entry?.actor_id).toBe(staffId);
+    expect(entry?.detail.source).toBe("poll");
+  });
+
+  it("✓ a mapped 'delivered' poll result completes a ship_to_new_employee order and stamps confirmed_received_at", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Safeplace Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at")
+      .eq("id", shipOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    expect(order?.confirmed_received_at).not.toBeNull();
+  });
+
+  it("✓ the same delivered poll result applied again is a no-op (idempotent via the state guard)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Safeplace Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(false); // already completed, no eligible transition
+  });
+
+  it("✓ a mapped 'delivered' poll result completes a return order, matched by return_tracking_number, without stamping confirmed_received_at", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: returnOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: returnTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Safeplace Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at")
+      .eq("id", returnOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    expect(order?.confirmed_received_at).toBeNull();
+  });
+});
+
+describe("Security: internal-only SECURITY DEFINER functions never leak EXECUTE to anon/authenticated -- poll feature additions (20260813)", () => {
+  it("✗ get_sendcloud_api_credentials and apply_sendcloud_poll_result grant no EXECUTE to anon or authenticated", async () => {
+    const { data: leaks, error: leakError } = await adminClient
+      .from("internal_function_grant_leaks")
+      .select("routine_name, grantee")
+      .in("routine_name", ["get_sendcloud_api_credentials", "apply_sendcloud_poll_result"]);
+    expect(leakError).toBeNull();
+    expect(leaks).toEqual([]);
+  });
+});
+
 describe("mark_return_completed() — staff-facing close-out for return orders (Phase 4 gap, closed 20260811)", () => {
   // Covers the function itself in isolation (service_role gate, actor
   // validation, service_type/state guards) -- the describe block above only
