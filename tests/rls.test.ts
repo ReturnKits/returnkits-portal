@@ -1477,6 +1477,195 @@ describe("apply_sendcloud_tracking_event() / in_transit status (Phase 6 tracking
   });
 });
 
+describe("apply_sendcloud_tracking_event() / delivered -> completed (20260813)", () => {
+  // Extends the same RPC with a second real transition: a mapped
+  // 'delivered' status_code now auto-closes the order out, the same
+  // terminal state confirm_received/mark_return_completed already produce
+  // manually -- clarified with the user that return orders ship back to
+  // the company's own HQ/IT address (never a ReturnKits warehouse), so
+  // "delivered" is a legitimate completion signal on either leg, not just
+  // the outbound one.
+  let company: { id: string };
+  const custEmail = uniqueEmail("p6-delivered-cust");
+  const staffEmail = uniqueEmail("p6-delivered-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let shipFromDispatchedId: string;
+  let shipFromInTransitId: string;
+  let returnOrderId: string;
+  let cancelledOrderId: string;
+  const shipFromDispatchedTracking = `SFD-${Date.now()}`;
+  const shipFromInTransitTracking = `SFT-${Date.now()}`;
+  const returnTracking = `RETD-${Date.now()}`;
+  const cancelledTracking = `CXL-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Phase6 Delivered Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Delivered Test", email: "delivered@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(custEmail);
+
+    const makeShipOrder = async () => {
+      const { data, error } = await client.rpc("create_order", {
+        p_kit_type_id: "phone",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employee.id,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+
+    shipFromDispatchedId = await makeShipOrder();
+    shipFromInTransitId = await makeShipOrder();
+    cancelledOrderId = await makeShipOrder();
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: (addr as { id: string }).id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: shipFromDispatchedTracking })
+      .eq("id", shipFromDispatchedId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "in_transit", outbound_tracking_number: shipFromInTransitTracking })
+      .eq("id", shipFromInTransitId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", return_tracking_number: returnTracking })
+      .eq("id", returnOrderId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "cancelled", outbound_tracking_number: cancelledTracking })
+      .eq("id", cancelledOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✓ a mapped 'delivered' event completes a ship_to_new_employee order from 'dispatched' and stamps confirmed_received_at", async () => {
+    const eventAt = new Date().toISOString();
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: shipFromDispatchedTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: eventAt,
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("outbound");
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at, fulfilment_log")
+      .eq("id", shipFromDispatchedId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    expect(order?.confirmed_received_at).not.toBeNull();
+    const log = order?.fulfilment_log as Array<{ action: string }>;
+    expect(log.some((entry) => entry.action === "delivered")).toBe(true);
+  });
+
+  it("✓ a mapped 'delivered' event completes a ship_to_new_employee order from 'in_transit' too (widened guard)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: shipFromInTransitTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", shipFromInTransitId).single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+
+  it("✓ a mapped 'delivered' event completes a return order too, matched by return_tracking_number, without stamping confirmed_received_at", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: returnTracking,
+      p_carrier_code: "royal_mail",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at")
+      .eq("id", returnOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    expect(order?.confirmed_received_at).toBeNull(); // that field belongs to the ship_to_new_employee/confirm_received flow only
+  });
+
+  it("✓ the same delivered event applied again is a no-op (idempotent via the state guard)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: shipFromDispatchedTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(false); // already completed, no eligible transition
+  });
+
+  it("✓ a delivered event on a cancelled order is a no-op, not an error", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: cancelledTracking,
+      p_carrier_code: "dpd",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.matched).toBe(true);
+    expect(data?.applied).toBe(false);
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", cancelledOrderId).single();
+    expect(order?.fulfilment_status).toBe("cancelled"); // unchanged
+  });
+});
+
 describe("mark_return_completed() — staff-facing close-out for return orders (Phase 4 gap, closed 20260811)", () => {
   // Covers the function itself in isolation (service_role gate, actor
   // validation, service_type/state guards) -- the describe block above only
