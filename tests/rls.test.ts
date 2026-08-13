@@ -836,6 +836,22 @@ describe("record_stripe_payment() — atomicity and idempotency (Phase 3)", () =
   const ownerEmail = uniqueEmail("pay-owner");
   let employee: { id: string };
   let orderId: string;
+  // Set by the "marks the order paid" test, reused by the "replaying"
+  // test below -- a true idempotent replay means the exact same event_id
+  // arriving twice, not a fresh event_id against an order that happens to
+  // already be paid (that's a different case, covered by the "refuses to
+  // pay an order that's no longer pending" test further down).
+  let paidArgs: {
+    p_event_id: string;
+    p_event_type: string;
+    p_checkout_session_id: string;
+    p_payment_intent_id: string;
+    p_company_id: string;
+    p_order_ids: string[];
+    p_subtotal_ex_vat_pence: number;
+    p_vat_pence: number;
+    p_total_inc_vat_pence: number;
+  };
 
   beforeAll(async () => {
     company = await createCompany("Payment Test Co");
@@ -890,8 +906,7 @@ describe("record_stripe_payment() — atomicity and idempotency (Phase 3)", () =
   it("✓ service_role: marks the order paid and issues a gapless invoice number", async () => {
     const eventId = `evt_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
     const sessionId = `cs_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-
-    const { data: invoiceId, error } = await adminClient.rpc("record_stripe_payment", {
+    paidArgs = {
       p_event_id: eventId,
       p_event_type: "checkout.session.completed",
       p_checkout_session_id: sessionId,
@@ -901,7 +916,9 @@ describe("record_stripe_payment() — atomicity and idempotency (Phase 3)", () =
       p_subtotal_ex_vat_pence: 4000,
       p_vat_pence: 800,
       p_total_inc_vat_pence: 4800,
-    });
+    };
+
+    const { data: invoiceId, error } = await adminClient.rpc("record_stripe_payment", paidArgs);
     expect(error).toBeNull();
     expect(invoiceId).not.toBeNull();
 
@@ -923,43 +940,41 @@ describe("record_stripe_payment() — atomicity and idempotency (Phase 3)", () =
   });
 
   it("✓ replaying the same event id twice changes nothing (exit criterion, architecture §9.7)", async () => {
-    const eventId = `evt_replay_${Date.now()}`;
-    const sessionId = `cs_replay_${Date.now()}`;
-    const args = {
-      p_event_id: eventId,
-      p_event_type: "checkout.session.completed",
-      p_checkout_session_id: sessionId,
-      p_payment_intent_id: `pi_${sessionId}`,
-      p_company_id: company.id,
-      p_order_ids: [orderId],
-      p_subtotal_ex_vat_pence: 4000,
-      p_vat_pence: 800,
-      p_total_inc_vat_pence: 4800,
-    };
-
-    // This order was already marked paid by the previous test, so on a
-    // *first* delivery record_stripe_payment would now correctly refuse it
-    // (order set no longer 'pending') -- but replaying the SAME event id
-    // must short-circuit on the idempotency check before that logic ever
-    // runs, and return null rather than raising.
-    const first = await adminClient.rpc("record_stripe_payment", args);
-    expect(first.error).toBeNull();
-    expect(first.data).toBeNull();
-
+    // A true idempotent replay is Stripe redelivering the SAME event_id --
+    // reuse paidArgs from the previous test verbatim, not a fresh event_id.
+    // The order is already 'paid' from that previous test, so this proves
+    // the idempotency check (keyed on event_id, already recorded in
+    // stripe_webhook_events) short-circuits BEFORE the function ever gets
+    // to its "order set no longer pending" guard -- a genuinely new event_id
+    // reaching that same already-paid order is the separate, deliberately
+    // different case covered by the "refuses to pay an order that's no
+    // longer pending" test below.
     const { count: invoiceCountBefore } = await adminClient
       .from("invoices")
       .select("id", { count: "exact", head: true })
-      .eq("stripe_checkout_session_id", sessionId);
-    expect(invoiceCountBefore).toBe(0);
+      .eq("stripe_checkout_session_id", paidArgs.p_checkout_session_id);
+    expect(invoiceCountBefore).toBe(1);
 
-    const second = await adminClient.rpc("record_stripe_payment", args);
+    const first = await adminClient.rpc("record_stripe_payment", paidArgs);
+    expect(first.error).toBeNull();
+    expect(first.data).toBeNull();
+
+    const second = await adminClient.rpc("record_stripe_payment", paidArgs);
     expect(second.error).toBeNull();
     expect(second.data).toBeNull();
+
+    // Still exactly the one invoice from the original successful payment --
+    // replaying never mints a second one.
+    const { count: invoiceCountAfter } = await adminClient
+      .from("invoices")
+      .select("id", { count: "exact", head: true })
+      .eq("stripe_checkout_session_id", paidArgs.p_checkout_session_id);
+    expect(invoiceCountAfter).toBe(1);
 
     const { count: eventCount } = await adminClient
       .from("stripe_webhook_events")
       .select("event_id", { count: "exact", head: true })
-      .eq("event_id", eventId);
+      .eq("event_id", paidArgs.p_event_id);
     expect(eventCount).toBe(1);
   });
 
@@ -2056,11 +2071,23 @@ describe("RLS: public.communication_log — customer-visible, service_role-writt
       .single();
     if (empError) throw empError;
 
+    // A 'return' order needs somewhere to return the device to
+    // (orders_return_needs_address CHECK constraint) -- same pattern used
+    // elsewhere in this suite (e.g. the confirm_received/mark_return_completed
+    // describe blocks).
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: companyA.id, label: "HQ", address_line1: "1 Comm Log Street", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
     const a1Client = await clientAsUser(a1Email);
     const { data: newOrderId, error: orderError } = await a1Client.rpc("create_order", {
       p_kit_type_id: "laptop",
       p_service_type: "return",
       p_employee_id: employee!.id,
+      p_return_address_id: (addr as { id: string }).id,
     });
     if (orderError) throw orderError;
     orderA = { id: newOrderId as string };
@@ -2436,11 +2463,21 @@ describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown
       .single();
     if (empError) throw empError;
 
+    // A 'return' order needs somewhere to return the device to
+    // (orders_return_needs_address CHECK constraint).
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Checkin Street", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
     const client = await clientAsUser(email);
     const { data: newOrderId, error: orderError } = await client.rpc("create_order", {
       p_kit_type_id: "laptop",
       p_service_type: "return",
       p_employee_id: employee!.id,
+      p_return_address_id: (addr as { id: string }).id,
     });
     if (orderError) throw orderError;
     returnOrder = { id: newOrderId as string };
@@ -2942,6 +2979,66 @@ describe("RLS: internal-only tables default-deny for every client role (gap clos
   });
 });
 
+describe("Security: internal-only SECURITY DEFINER functions never leak EXECUTE to anon/authenticated (20260813)", () => {
+  // Found the hard way: `revoke all ... from public` does NOT remove
+  // Supabase's own default-privilege grant of EXECUTE on every new
+  // public-schema function to anon/authenticated -- that gap was already
+  // documented and fixed once for record_stripe_payment
+  // (20260807230100_lock_down_record_stripe_payment.sql), but every
+  // migration since that added a new internal-only function repeated the
+  // same "revoke all from public" mistake instead of following that
+  // precedent, silently re-opening the hole each time. Found by directly
+  // querying pg_proc/information_schema.routine_privileges against the
+  // hosted project, not by this test -- which is exactly the gap this test
+  // closes. Most severe instance found: get_sendcloud_webhook_secret() had
+  // NO internal role check in its body at all and was callable by anon --
+  // any caller with just the public anon key could have read the plaintext
+  // Sendcloud webhook signing secret and forged valid signed webhook
+  // payloads. Fixed in 20260813170000_lock_down_leaked_internal_function_grants.sql.
+  //
+  // This test doesn't re-derive the list from scratch (that would just be
+  // testing the schema against itself) -- it's a fixed, deliberately
+  // maintained allowlist of every function that is architecturally meant
+  // to be internal/webhook-only per CLAUDE.md. Add to this list whenever a
+  // new service_role-only RPC is introduced.
+  const internalOnlyFunctions = [
+    "record_stripe_payment",
+    "record_credit_purchase",
+    "record_card_setup",
+    "get_sendcloud_webhook_secret",
+    "get_resend_webhook_secret",
+    "apply_sendcloud_tracking_event",
+    "create_internal_order",
+    "assert_internal_actor",
+    "mark_order_dispatched",
+    "mark_order_paid",
+    "cancel_order",
+    "flag_cover_claim",
+    "mark_return_completed",
+    "update_order_tracking",
+    "next_reference_number",
+    "log_audit",
+    "orders_needing_checkin",
+    "order_dispatched_at",
+  ];
+
+  it("✗ no internal-only function grants EXECUTE to anon or authenticated", async () => {
+    // PostgREST only exposes the public schema's own tables/views, not
+    // information_schema directly -- internal_function_grant_leaks is a
+    // thin view over information_schema.routine_privileges, created by the
+    // same lockdown migration, seeded for exactly this check. No grants are
+    // given to anon/authenticated on the view itself (service_role reads it
+    // via the usual RLS-bypass path), so it can't be used to fingerprint
+    // the schema from outside either.
+    const { data: leaks, error: leakError } = await adminClient
+      .from("internal_function_grant_leaks")
+      .select("routine_name, grantee")
+      .in("routine_name", internalOnlyFunctions);
+    expect(leakError).toBeNull();
+    expect(leaks).toEqual([]);
+  });
+});
+
 describe("Enhanced Cover — cover_tiers, order snapshotting, and flag_cover_claim (20260812)", () => {
   // Built after the fact: the architecture doc (§20) fully designed Enhanced
   // Cover, but nothing was ever wired up -- no table, no UI, nothing live --
@@ -3336,17 +3433,21 @@ describe("Prepaid credits — credit_ledger RLS, redemption, purchase, and resto
     });
 
     it("✓ redeems a credit: order is created paid, snapshotted to its ledger debit, and the balance drops by one", async () => {
+      // Relative, not hardcoded: the earlier "✗ isolation" test in this
+      // file already seeded 5 "laptop" credits for companyA, so the
+      // balance here is cumulative, not just this test's own +2 seed.
+      const balanceBeforeSeed = await balanceFor(companyA.id, "laptop");
       await adminClient.from("credit_ledger").insert({
         company_id: companyA.id,
         kit_type_id: "laptop",
         transaction_type: "purchase",
         direction: "credit",
         quantity: 2,
-        balance_after: 2,
+        balance_after: balanceBeforeSeed + 2,
         reason: "seed for redemption test",
       });
       const balanceBefore = await balanceFor(companyA.id, "laptop");
-      expect(balanceBefore).toBe(2);
+      expect(balanceBefore).toBe(balanceBeforeSeed + 2);
 
       const client = await clientAsUser(a1Email);
       const { data: orderId, error } = await client.rpc("create_order", {
@@ -3374,10 +3475,10 @@ describe("Prepaid credits — credit_ledger RLS, redemption, purchase, and resto
       expect(ledgerRow?.direction).toBe("debit");
       expect(ledgerRow?.quantity).toBe(1);
       expect(ledgerRow?.order_id).toBe(orderId);
-      expect(ledgerRow?.balance_after).toBe(1);
+      expect(ledgerRow?.balance_after).toBe(balanceBefore - 1);
 
       const balanceAfter = await balanceFor(companyA.id, "laptop");
-      expect(balanceAfter).toBe(1);
+      expect(balanceAfter).toBe(balanceBefore - 1);
     });
 
     it("✗ database constraint: paid_with_credit and credit_transaction_id must agree (orders_credit_snapshot_consistent)", async () => {
