@@ -2347,6 +2347,91 @@ describe("RLS: public.companies — isolation, collaboration, and admin-only upd
   });
 });
 
+describe("RLS: public.users update — profile fields for the Settings page (20260813)", () => {
+  // No new migration policy was written for this feature -- full_name and
+  // phone are plain columns on an existing table, and the existing
+  // users_update_admin_or_internal policy (company_admin, or internal,
+  // scoped to current_company()) already covers them column-agnostically.
+  // These tests exist to prove that claim rather than assume it, and to
+  // pin down the deliberate scope decision: only company_admin can write
+  // these columns, including their own -- there is no self-update policy
+  // for a plain company_member yet (flagged as a known gap, not a bug).
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const adminEmail = uniqueEmail("settings-admin");
+  const memberEmail = uniqueEmail("settings-member");
+  const bAdminEmail = uniqueEmail("settings-b-admin");
+
+  beforeAll(async () => {
+    companyA = await createCompany("Settings RLS Test Co A");
+    companyB = await createCompany("Settings RLS Test Co B");
+
+    const admin = await createAuthUser(adminEmail);
+    const member = await createAuthUser(memberEmail);
+    const bAdmin = await createAuthUser(bAdminEmail);
+
+    await createProfile(admin.id, companyA.id, adminEmail, "company_admin");
+    await createProfile(member.id, companyA.id, memberEmail, "company_member");
+    await createProfile(bAdmin.id, companyB.id, bAdminEmail, "company_admin");
+  });
+
+  afterAll(async () => {
+    for (const email of [adminEmail, memberEmail, bAdminEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  it("✓ company_admin can update their own full_name and phone", async () => {
+    const client = await clientAsUser(adminEmail);
+    const { error } = await client
+      .from("users")
+      .update({ full_name: "Pat Admin", phone: "+44 7700 900001" })
+      .eq("email", adminEmail);
+    expect(error).toBeNull();
+    const { data } = await adminClient
+      .from("users")
+      .select("full_name, phone")
+      .eq("email", adminEmail)
+      .single();
+    expect(data?.full_name).toBe("Pat Admin");
+    expect(data?.phone).toBe("+44 7700 900001");
+  });
+
+  it("✓ collaboration: company_admin can update a colleague's profile fields (existing admin-manages-company scope)", async () => {
+    const client = await clientAsUser(adminEmail);
+    const { error } = await client
+      .from("users")
+      .update({ full_name: "Sam Member" })
+      .eq("email", memberEmail);
+    expect(error).toBeNull();
+    const { data } = await adminClient.from("users").select("full_name").eq("email", memberEmail).single();
+    expect(data?.full_name).toBe("Sam Member");
+  });
+
+  it("✗ a company_member (not admin) cannot update even their own profile fields", async () => {
+    const client = await clientAsUser(memberEmail);
+    const { error, count } = await client
+      .from("users")
+      .update({ full_name: "Should Not Land" })
+      .eq("email", memberEmail)
+      .select("id", { count: "exact" });
+    expect(error).toBeNull();
+    expect(count).toBe(0);
+  });
+
+  it("✗ isolation: a company_admin in company B cannot update a user in company A", async () => {
+    const client = await clientAsUser(bAdminEmail);
+    const { error, count } = await client
+      .from("users")
+      .update({ full_name: "Cross Tenant" })
+      .eq("email", adminEmail)
+      .select("id", { count: "exact" });
+    expect(error).toBeNull();
+    expect(count).toBe(0);
+  });
+});
+
 describe("RLS: public.bundles — isolation and collaboration via create_bundle() (gap closed post-Phase-5)", () => {
   let companyA: { id: string };
   let companyB: { id: string };
