@@ -567,8 +567,15 @@ async function sendEmployeeCopy(props: {
   employeeName: string | null;
   courier: string | null;
   trackingUrl: string | null;
+  notifyEmployee: boolean;
 }): Promise<void> {
   if (props.type !== "dispatched" && props.type !== "checkin_sent") return;
+  // Per-order opt-in (20260813, orders.notify_employee -- off by default).
+  // The person placing the order decides, order by order, whether the
+  // named employee gets these nudges at all. This sits ON TOP OF the
+  // employee-has-no-email check below and the caller's own
+  // notification_preferences gate -- all three must clear for a send.
+  if (!props.notifyEmployee) return;
   if (!props.employeeEmail || !props.employeeName) return;
 
   const recipient = props.employeeEmail;
@@ -710,7 +717,7 @@ async function handleRequest(req: Request): Promise<Response> {
     .from("orders")
     .select(
       `id, reference, bundle_id, service_type, price_ex_vat_pence, created_by, created_at, return_address_id,
-       outbound_courier, outbound_tracking_number, outbound_tracking_url, employee_id,
+       outbound_courier, outbound_tracking_number, outbound_tracking_url, employee_id, notify_employee,
        company:companies(id, name), kit_types(label),
        employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
     )
@@ -734,6 +741,7 @@ async function handleRequest(req: Request): Promise<Response> {
     outbound_tracking_number: string | null;
     outbound_tracking_url: string | null;
     employee_id: string;
+    notify_employee: boolean;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
     employees: { full_name: string; email: string | null; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
@@ -933,6 +941,7 @@ async function handleRequest(req: Request): Promise<Response> {
     employeeName: o.employees?.full_name ?? null,
     courier: o.outbound_courier,
     trackingUrl: o.outbound_tracking_url,
+    notifyEmployee: o.notify_employee,
   });
 
   if (!resendResp.ok) {

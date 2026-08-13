@@ -562,6 +562,32 @@ describe("RLS: public.orders — isolation, collaboration, and create_order()", 
     // Reset for any later test in this block that assumes 'pending'.
     await adminClient.from("orders").update({ payment_status: "pending" }).eq("id", orderAId);
   });
+
+  // 20260813: per-order control over the employee-facing passive nudges
+  // (dispatched/checkin_sent). Off by default, one flag covers both events,
+  // set at creation only. These two tests prove create_order() sets the
+  // column correctly in both directions -- the actual gating of the email
+  // send itself lives in send-order-email (Edge Function), out of reach of
+  // this Postgres-level suite, so this is the boundary this suite can test.
+  it("create_order() defaults notify_employee to false when not passed", async () => {
+    // orderAId was created in beforeAll without p_notify_employee.
+    const { data } = await adminClient.from("orders").select("notify_employee").eq("id", orderAId).single();
+    expect(data?.notify_employee).toBe(false);
+  });
+
+  it("create_order() sets notify_employee to true when explicitly opted in", async () => {
+    const client = await clientAsUser(a1Email);
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+      p_notify_employee: true,
+    });
+    expect(error).toBeNull();
+
+    const { data } = await adminClient.from("orders").select("notify_employee").eq("id", orderId as string).single();
+    expect(data?.notify_employee).toBe(true);
+  });
 });
 
 describe("RLS: public.invoices — isolation, collaboration, and client write protection (Phase 3)", () => {
@@ -1057,6 +1083,39 @@ describe("mark_order_dispatched() / create_internal_order() — the Retool write
     expect(order?.source).toBe("internal_staff");
     expect(order?.created_by).toBe(staffId);
     expect(order?.reference).toMatch(/^RKP-\d{6}-\d{3,}$/);
+  });
+
+  it("create_internal_order() also defaults notify_employee to false and accepts the opt-in (20260813)", async () => {
+    const { data: defaultOrderId, error: defaultError } = await adminClient.rpc("create_internal_order", {
+      p_company_id: company.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "monitor",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    expect(defaultError).toBeNull();
+    const { data: defaultOrder } = await adminClient
+      .from("orders")
+      .select("notify_employee")
+      .eq("id", defaultOrderId as string)
+      .single();
+    expect(defaultOrder?.notify_employee).toBe(false);
+
+    const { data: optInOrderId, error: optInError } = await adminClient.rpc("create_internal_order", {
+      p_company_id: company.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "monitor",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+      p_notify_employee: true,
+    });
+    expect(optInError).toBeNull();
+    const { data: optInOrder } = await adminClient
+      .from("orders")
+      .select("notify_employee")
+      .eq("id", optInOrderId as string)
+      .single();
+    expect(optInOrder?.notify_employee).toBe(true);
   });
 });
 
