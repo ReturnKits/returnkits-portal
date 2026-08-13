@@ -1894,6 +1894,65 @@ describe("RLS: public.communication_log — customer-visible, service_role-writt
     expect(data?.[0].recipient).toBe(a1Email);
   });
 
+  // 20260813: audience='employee' rows (added for the passive
+  // dispatched/checkin_sent notices to the employee on file) use the exact
+  // same communication_log_select_own_company policy as 'customer'/'internal'
+  // rows -- the migration widened the CHECK constraint only, no policy
+  // change. Proving that here rather than assuming it, per this project's
+  // "both directions, every tenant-scoped table" rule: an employee-audience
+  // row must still be readable by company A (isolation + collaboration) and
+  // still invisible to company B.
+  describe("audience='employee' rows (20260813)", () => {
+    let employeeCommId: string;
+
+    beforeAll(async () => {
+      const { data, error } = await adminClient
+        .from("communication_log")
+        .insert({
+          order_id: orderA.id,
+          company_id: companyA.id,
+          channel: "email",
+          type: "dispatched",
+          audience: "employee",
+          recipient: "commlog-emp@example.com",
+          subject: "A ReturnKits box is on its way to you",
+          status: "sent",
+          provider_message_id: `test-employee-${Date.now()}`,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      employeeCommId = data!.id;
+    });
+
+    afterAll(async () => {
+      await adminClient.from("communication_log").delete().eq("id", employeeCommId);
+    });
+
+    it("✗ isolation: company B still cannot read company A's employee-audience row", async () => {
+      const client = await clientAsUser(bEmail);
+      const { data, error } = await client.from("communication_log").select("*").eq("id", employeeCommId);
+      expect(error).toBeNull();
+      expect(data).toEqual([]);
+    });
+
+    it("✓ collaboration: user 2 in company A CAN read the employee-audience row for user 1's order", async () => {
+      const client = await clientAsUser(a2Email);
+      const { data, error } = await client.from("communication_log").select("*").eq("id", employeeCommId);
+      expect(error).toBeNull();
+      expect(data?.length).toBe(1);
+      expect(data?.[0].audience).toBe("employee");
+      expect(data?.[0].recipient).toBe("commlog-emp@example.com");
+    });
+
+    it("✓ the portal user who placed the order (a1, admin) can also read it", async () => {
+      const client = await clientAsUser(a1Email);
+      const { data, error } = await client.from("communication_log").select("*").eq("id", employeeCommId);
+      expect(error).toBeNull();
+      expect(data?.length).toBe(1);
+    });
+  });
+
   it("✗ clients cannot insert communication_log rows directly — service_role only", async () => {
     const client = await clientAsUser(a1Email);
     const { error } = await client.from("communication_log").insert({

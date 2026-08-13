@@ -53,7 +53,85 @@
 // (the 3-day cooldown in orders_needing_checkin()).
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { captureError } from "../_shared/sentry.ts";
+
+// Inlined from ../_shared/sentry.ts (20260813): the deploy_edge_function
+// MCP tool wasn't reliably bundling the cross-function shared import --
+// repeated deploys errored "Module not found ... _shared/sentry.ts" even
+// with the file included in the payload, despite the exact same shared-file
+// pattern working for this function's earlier versions (presumably deployed
+// via the Supabase CLI directly, which handles the real functions/
+// directory structure differently than this MCP tool's bundler does).
+// Inlining is the pragmatic fix rather than continuing to guess at the
+// tool's path semantics -- content is otherwise identical to
+// supabase/functions/_shared/sentry.ts. If other functions hit the same
+// bundling issue, worth revisiting whether the shared-module pattern is
+// still viable for MCP-based deploys, or whether it needs the CLI.
+const SENTRY_DSN = Deno.env.get("SENTRY_DSN");
+
+function parseDsn(dsn: string): { host: string; projectId: string; publicKey: string } | null {
+  try {
+    const url = new URL(dsn);
+    const publicKey = url.username;
+    const projectId = url.pathname.replace(/^\//, "");
+    if (!publicKey || !projectId) return null;
+    return { host: url.host, projectId, publicKey };
+  } catch {
+    return null;
+  }
+}
+
+const sentryParsed = SENTRY_DSN ? parseDsn(SENTRY_DSN) : null;
+
+function sentryEventId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function captureError(
+  err: unknown,
+  context: { function: string; [key: string]: unknown } = { function: "unknown" },
+): void {
+  console.error(`[${context.function}]`, err);
+  if (!sentryParsed) return;
+
+  const error = err instanceof Error ? err : new Error(typeof err === "string" ? err : JSON.stringify(err));
+  const { function: fnName, ...extra } = context;
+
+  const event = {
+    event_id: sentryEventId(),
+    timestamp: new Date().toISOString(),
+    platform: "other",
+    level: "error",
+    logger: "edge-function",
+    server_name: fnName,
+    environment: Deno.env.get("SENTRY_ENVIRONMENT") ?? "production",
+    tags: { function: fnName },
+    extra,
+    exception: {
+      values: [
+        {
+          type: error.name || "Error",
+          value: error.message,
+          stacktrace: error.stack
+            ? { frames: error.stack.split("\n").map((line) => ({ filename: line.trim() })) }
+            : undefined,
+        },
+      ],
+    },
+  };
+
+  const endpoint = `https://${sentryParsed.host}/api/${sentryParsed.projectId}/store/`;
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Sentry-Auth": `Sentry sentry_version=7, sentry_key=${sentryParsed.publicKey}, sentry_client=returnkits-edge/1.0`,
+    },
+    body: JSON.stringify(event),
+  }).catch((sentryErr) => {
+    console.error(`[${fnName}] failed to report to Sentry:`, sentryErr);
+  });
+}
 
 const supabaseUrl = Deno.env.get("SUPABASE_URL");
 const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -424,6 +502,173 @@ function buildCheckinReceivedEmail(props: { companyName: string; reference: stri
   return layout(`Has the kit arrived? — ${props.reference}`, body);
 }
 
+// ---- Employee-facing copies (20260813, dispatched + checkin_sent only) --
+//
+// Passive notices to the employee named on the order (orders.employee_id ->
+// employees.email) -- NOT the portal user who placed it. Deliberately
+// minimal: no pricing, no reference number, no company billing detail, per
+// the explicit "I don't want the employee to get order details" ask. Only
+// built for 'dispatched' and 'checkin_sent' -- see the accompanying
+// migration's comment for why those two specifically and not
+// order_confirmation / checkin_received.
+
+function buildEmployeeDispatchedEmail(props: {
+  employeeName: string;
+  companyName: string;
+  serviceType: string;
+  courier: string;
+  trackingUrl: string | null;
+}): string {
+  const isReturn = props.serviceType === "return";
+
+  const whatNext = isReturn
+    ? `<p style="font-size:14px;line-height:22px;color:#374151;margin:16px 0 0;">
+         Once it arrives, please use it to post your old device back — everything you need, including a
+         prepaid return label, is already inside the box. No need to let anyone know once it's done.
+       </p>`
+    : `<p style="font-size:14px;line-height:22px;color:#374151;margin:16px 0 0;">
+         Nothing else to do once it arrives — it's ready to use.
+       </p>`;
+
+  const body = `
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">A ReturnKits box is on its way to you</h1>
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 4px;">Hi ${escapeHtml(props.employeeName)},</p>
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 16px;">
+      ${escapeHtml(props.companyName)} has arranged a ReturnKits delivery for you, sent via ${escapeHtml(props.courier)}.
+    </p>
+    ${props.trackingUrl ? trackButton(props.trackingUrl) : ""}
+    ${whatNext}
+  `;
+  return layout("A ReturnKits box is on its way to you", body);
+}
+
+function buildEmployeeCheckinSentEmail(props: { employeeName: string }): string {
+  const body = `
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+      Hi ${escapeHtml(props.employeeName)}, when you get a chance, please pop your old device in the post
+      using the prepaid label included in the box we sent you. No need to let anyone know once it's done.
+    </p>
+  `;
+  return layout("Just a reminder — please post your device back", body);
+}
+
+// Fires alongside the customer-facing send for 'dispatched'/'checkin_sent'
+// only, independent of whether the customer send above succeeded -- these
+// are two separate recipients and one failing shouldn't block the other.
+// Silently no-ops if the order's employee has no email on file (an optional
+// field) or if the event type isn't one of the two this applies to.
+// Inherits the caller's notification_preferences gate for free -- this is
+// only ever invoked after that check has already passed.
+async function sendEmployeeCopy(props: {
+  type: EmailType;
+  order: { id: string; service_type: string; company: { id: string; name: string } };
+  employeeEmail: string | null;
+  employeeName: string | null;
+  courier: string | null;
+  trackingUrl: string | null;
+}): Promise<void> {
+  if (props.type !== "dispatched" && props.type !== "checkin_sent") return;
+  if (!props.employeeEmail || !props.employeeName) return;
+
+  const recipient = props.employeeEmail;
+  const subject =
+    props.type === "dispatched"
+      ? "A ReturnKits box is on its way to you"
+      : "Just a reminder — please post your device back";
+
+  // One-shot for dispatched, scoped to this order specifically (not
+  // bundle-aware like the customer confirmation -- an employee only cares
+  // about their own kit, not any siblings in the same bundle). checkin_sent
+  // needs no separate idempotency check here: orders_needing_checkin()'s own
+  // 3-day cooldown already prevents this function being invoked again too
+  // soon, and it looks at the type across both audiences.
+  if (props.type === "dispatched") {
+    const { data: existing } = await supabase
+      .from("communication_log")
+      .select("id")
+      .eq("type", "dispatched")
+      .eq("audience", "employee")
+      .eq("order_id", props.order.id)
+      .in("status", ["sent", "delivered"])
+      .limit(1);
+    if (existing && existing.length > 0) return;
+  }
+
+  const { data: suppressed } = await supabase
+    .from("suppressed_recipients")
+    .select("email")
+    .eq("email", recipient.toLowerCase())
+    .maybeSingle();
+
+  if (suppressed) {
+    await supabase.from("communication_log").insert({
+      order_id: props.order.id,
+      company_id: props.order.company.id,
+      channel: "email",
+      type: props.type,
+      audience: "employee",
+      recipient,
+      subject,
+      status: "suppressed",
+    });
+    return;
+  }
+
+  const html =
+    props.type === "dispatched"
+      ? buildEmployeeDispatchedEmail({
+          employeeName: props.employeeName,
+          companyName: props.order.company.name,
+          serviceType: props.order.service_type,
+          courier: props.courier ?? "Courier",
+          trackingUrl: props.trackingUrl,
+        })
+      : buildEmployeeCheckinSentEmail({ employeeName: props.employeeName });
+
+  try {
+    const resendResp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ from: FROM_ADDRESS, to: recipient, subject, html }),
+    });
+    const resendBody = await resendResp.json().catch(() => ({}));
+
+    await supabase.from("communication_log").insert({
+      order_id: props.order.id,
+      company_id: props.order.company.id,
+      channel: "email",
+      type: props.type,
+      audience: "employee",
+      recipient,
+      subject,
+      status: resendResp.ok ? "sent" : "failed",
+      provider_message_id: resendResp.ok ? (resendBody.id ?? null) : null,
+      error_message: resendResp.ok ? null : JSON.stringify(resendBody).slice(0, 1000),
+    });
+
+    if (!resendResp.ok) {
+      captureError(new Error(`Resend send failed (employee copy): ${JSON.stringify(resendBody).slice(0, 500)}`), {
+        function: "send-order-email",
+        orderId: props.order.id,
+        type: props.type,
+        audience: "employee",
+      });
+    }
+  } catch (err) {
+    captureError(err, {
+      function: "send-order-email",
+      orderId: props.order.id,
+      type: props.type,
+      audience: "employee",
+      step: "employee copy",
+    });
+  }
+}
+
 // ---- Handler --------------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
@@ -467,7 +712,7 @@ async function handleRequest(req: Request): Promise<Response> {
       `id, reference, bundle_id, service_type, price_ex_vat_pence, created_by, created_at, return_address_id,
        outbound_courier, outbound_tracking_number, outbound_tracking_url, employee_id,
        company:companies(id, name), kit_types(label),
-       employees(full_name, address_line1, address_line2, city, postcode, country)`,
+       employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
     )
     .eq("id", orderId)
     .maybeSingle();
@@ -491,7 +736,7 @@ async function handleRequest(req: Request): Promise<Response> {
     employee_id: string;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
-    employees: { full_name: string; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
+    employees: { full_name: string; email: string | null; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
   };
 
   if (!o.company) {
@@ -678,6 +923,17 @@ async function handleRequest(req: Request): Promise<Response> {
   });
 
   const resendBody = await resendResp.json().catch(() => ({}));
+
+  // Employee-facing copy (dispatched/checkin_sent only) -- independent of
+  // whether the customer send above succeeded or failed.
+  await sendEmployeeCopy({
+    type,
+    order: { id: o.id, service_type: o.service_type, company: o.company },
+    employeeEmail: o.employees?.email ?? null,
+    employeeName: o.employees?.full_name ?? null,
+    courier: o.outbound_courier,
+    trackingUrl: o.outbound_tracking_url,
+  });
 
   if (!resendResp.ok) {
     await supabase.from("communication_log").insert({
