@@ -144,9 +144,15 @@ if (!supabaseUrl || !serviceRoleKey || !resendApiKey) {
 
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
-type EmailType = "order_confirmation" | "dispatched" | "checkin_sent" | "checkin_received";
+type EmailType = "order_confirmation" | "dispatched" | "checkin_sent" | "checkin_received" | "return_in_transit";
 
-const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_sent", "checkin_received"];
+const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_sent", "checkin_received", "return_in_transit"];
+
+// Fallback estimate when Sendcloud's tracking payload doesn't carry an
+// expected_delivery_date (added 20260814 for return_in_transit -- see that
+// section below). Judgment call, not derived from real delivery-time data;
+// revisit if actual return-leg transit times suggest a different number.
+const RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS = 2;
 
 // Simple substring match on the free-text courier field -- outbound_courier
 // isn't an enum (Sendcloud/Retool can type anything in), so this is a best
@@ -539,6 +545,55 @@ function buildCheckinReceivedEmail(props: { companyName: string; reference: stri
   return layout(`Has the kit arrived? — ${props.reference}`, body);
 }
 
+// ---- Return in transit (return orders, added 20260814) ------------------
+//
+// Fires once, when a return order's fulfilment_status moves
+// dispatched -> in_transit off the return leg's tracking number (the
+// courier's first scan after the leaver hands the box over) -- see
+// apply_sendcloud_tracking_event()/apply_sendcloud_poll_result() and the
+// two Edge Functions that call them. Deliberately customer-only, never an
+// employee copy: the leaver has already done their part by the time this
+// fires and has no portal access to check anything further, so there's
+// nothing for them to act on -- see the design discussion in CLAUDE.md.
+// estimatedArrivalDate is resolved by the caller (either Sendcloud's own
+// expected_delivery_date from the tracking payload, confirmed present in a
+// real response 20260814, or a working-day fallback) and passed straight
+// through here rather than recomputed -- this function only renders it.
+function buildReturnInTransitEmail(props: {
+  companyName: string;
+  reference: string;
+  kitLabel: string;
+  courier: string;
+  trackingNumber: string;
+  trackingUrl: string | null;
+  estimatedArrivalDate: string | null;
+}): string {
+  const trackingBlock = `
+    ${field("Courier", props.courier)}
+    ${field("Tracking number", props.trackingNumber)}
+    ${props.trackingUrl ? trackButton(props.trackingUrl) : ""}
+  `;
+
+  // "Around" + explicit caveat rather than a bare date -- a real Sendcloud
+  // expected_delivery_date checked 20260814 was a day early against the
+  // parcel's actual delivery, so this deliberately reads as an estimate,
+  // never a promise.
+  const etaLine = props.estimatedArrivalDate
+    ? `<p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">Estimated arrival: around ${escapeHtml(formatDate(props.estimatedArrivalDate))}. Courier estimates can shift by a day or so.</p>`
+    : "";
+
+  const body = `
+    <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Your return is on its way back</h1>
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} has been collected and is heading back to us.</p>
+    ${etaLine}
+    ${trackingBlock}
+    <p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">We'll let you know once it's arrived — nothing further to do on your end.</p>
+  `;
+
+  return layout(`Return in progress — ${props.reference}`, body);
+}
+
 // ---- Employee-facing copies (20260813, dispatched + checkin_sent only) --
 //
 // Passive notices to the employee named on the order (orders.employee_id ->
@@ -737,7 +792,7 @@ async function handleRequest(req: Request): Promise<Response> {
     return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
   }
 
-  let body: { orderId?: unknown; type?: unknown };
+  let body: { orderId?: unknown; type?: unknown; estimatedArrivalDate?: unknown };
   try {
     body = await req.json();
   } catch {
@@ -749,12 +804,18 @@ async function handleRequest(req: Request): Promise<Response> {
   if (!orderId || !type || !VALID_TYPES.includes(type)) {
     return new Response(JSON.stringify({ error: "orderId and a valid type are required" }), { status: 400 });
   }
+  // return_in_transit only: an ISO date the caller (sendcloud-webhook or
+  // poll-sendcloud-tracking) resolved from Sendcloud's own
+  // expected_delivery_date field on the tracking payload. Optional --
+  // falls back to a working-day estimate below when absent.
+  const callerEstimatedArrivalDate = typeof body.estimatedArrivalDate === "string" ? body.estimatedArrivalDate : null;
 
   const { data: order, error: orderError } = await supabase
     .from("orders")
     .select(
       `id, reference, bundle_id, service_type, price_ex_vat_pence, created_by, created_at, return_address_id,
-       outbound_courier, outbound_tracking_number, outbound_tracking_url, employee_id, notify_employee,
+       outbound_courier, outbound_tracking_number, outbound_tracking_url,
+       return_courier, return_tracking_number, return_tracking_url, employee_id, notify_employee,
        employee_name, employee_email, employee_address_line1, employee_address_line2, employee_city, employee_postcode, employee_country,
        company:companies(id, name), kit_types(label),
        employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
@@ -778,6 +839,9 @@ async function handleRequest(req: Request): Promise<Response> {
     outbound_courier: string | null;
     outbound_tracking_number: string | null;
     outbound_tracking_url: string | null;
+    return_courier: string | null;
+    return_tracking_number: string | null;
+    return_tracking_url: string | null;
     employee_id: string | null;
     notify_employee: boolean;
     employee_name: string | null;
@@ -866,7 +930,10 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Idempotency: for one-shot types, skip if any sibling order already has a sent/delivered row.
-  if (type === "order_confirmation" || type === "dispatched") {
+  // return_in_transit is naturally one-shot too -- the dispatched -> in_transit
+  // transition it's triggered from only ever fires once per return leg -- but
+  // this check is a defensive second layer, same reasoning as the other two.
+  if (type === "order_confirmation" || type === "dispatched" || type === "return_in_transit") {
     const { data: existing } = await supabase
       .from("communication_log")
       .select("id")
@@ -932,9 +999,38 @@ async function handleRequest(req: Request): Promise<Response> {
   } else if (type === "checkin_sent") {
     subject = `Reminder: please send your kit back — ${o.reference}`;
     html = buildCheckinSentEmail({ companyName: o.company.name, reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit" });
-  } else {
+  } else if (type === "checkin_received") {
     subject = `Has your kit arrived? — ${o.reference}`;
     html = buildCheckinReceivedEmail({ companyName: o.company.name, reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit" });
+  } else {
+    // return_in_transit: prefer the caller's resolved date (sourced from
+    // Sendcloud's expected_delivery_date on the tracking payload), fall
+    // back to a working-day estimate off today's date when the caller
+    // didn't have one to pass through.
+    let estimatedArrivalDate = callerEstimatedArrivalDate;
+    if (!estimatedArrivalDate) {
+      try {
+        const { data: fallbackDate } = await supabase.rpc("add_working_days", {
+          p_start: new Date().toISOString().slice(0, 10),
+          p_n: RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS,
+        });
+        estimatedArrivalDate = typeof fallbackDate === "string" ? fallbackDate : null;
+      } catch (err) {
+        captureError(err, { function: "send-order-email", orderId: o.id, step: "add_working_days fallback" });
+        estimatedArrivalDate = null;
+      }
+    }
+
+    subject = `Return in progress — ${o.reference}`;
+    html = buildReturnInTransitEmail({
+      companyName: o.company.name,
+      reference: o.reference,
+      kitLabel: o.kit_types?.label ?? "Kit",
+      courier: o.return_courier ?? "Courier",
+      trackingNumber: o.return_tracking_number ?? "—",
+      trackingUrl: o.return_tracking_url,
+      estimatedArrivalDate,
+    });
   }
 
   // Suppression check (Phase 5: resend-webhook populates this on hard

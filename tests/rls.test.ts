@@ -2416,6 +2416,82 @@ describe("RLS: public.communication_log — customer-visible, service_role-writt
     });
   });
 
+  // 20260814: 'return_in_transit' rows (the new "Your return is on its way
+  // back" customer email, fired off the courier's first scan on the return
+  // leg). The migration that added this type only widened
+  // communication_log_type_check -- same "policy already covers it" shape
+  // as the audience='employee' block above, but this is a new *type* value
+  // rather than a new *audience* value, so worth proving independently
+  // rather than assuming the CHECK constraint change alone is sufficient
+  // for both the insert to succeed and the existing RLS policy to still
+  // apply correctly to it.
+  describe("type='return_in_transit' rows (20260814)", () => {
+    let returnInTransitCommId: string;
+
+    beforeAll(async () => {
+      const { data, error } = await adminClient
+        .from("communication_log")
+        .insert({
+          order_id: orderA.id,
+          company_id: companyA.id,
+          channel: "email",
+          type: "return_in_transit",
+          audience: "customer",
+          recipient: a1Email,
+          subject: "Return in progress — TEST",
+          status: "sent",
+          provider_message_id: `test-return-in-transit-${Date.now()}`,
+        })
+        .select()
+        .single();
+      if (error) throw error;
+      returnInTransitCommId = data!.id;
+    });
+
+    afterAll(async () => {
+      await adminClient.from("communication_log").delete().eq("id", returnInTransitCommId);
+    });
+
+    it("✓ the CHECK constraint accepts 'return_in_transit' as a type", async () => {
+      const { data, error } = await adminClient
+        .from("communication_log")
+        .select("type")
+        .eq("id", returnInTransitCommId)
+        .single();
+      expect(error).toBeNull();
+      expect(data?.type).toBe("return_in_transit");
+    });
+
+    it("✗ isolation: company B cannot read company A's return_in_transit row", async () => {
+      const client = await clientAsUser(bEmail);
+      const { data, error } = await client.from("communication_log").select("*").eq("id", returnInTransitCommId);
+      expect(error).toBeNull();
+      expect(data).toEqual([]);
+    });
+
+    it("✓ collaboration: user 2 in company A CAN read the return_in_transit row for user 1's order", async () => {
+      const client = await clientAsUser(a2Email);
+      const { data, error } = await client.from("communication_log").select("*").eq("id", returnInTransitCommId);
+      expect(error).toBeNull();
+      expect(data?.length).toBe(1);
+      expect(data?.[0].recipient).toBe(a1Email);
+    });
+  });
+
+  it("✗ an unrecognised type is still rejected by the CHECK constraint", async () => {
+    const { error } = await adminClient.from("communication_log").insert({
+      order_id: orderA.id,
+      company_id: companyA.id,
+      channel: "email",
+      type: "not_a_real_type",
+      audience: "customer",
+      recipient: a1Email,
+      subject: "should never insert",
+      status: "sent",
+    });
+    expect(error).not.toBeNull();
+  });
+
   it("✗ clients cannot insert communication_log rows directly — service_role only", async () => {
     const client = await clientAsUser(a1Email);
     const { error } = await client.from("communication_log").insert({
@@ -2466,13 +2542,26 @@ describe("RLS: public.notification_preferences — read + toggle own company onl
     await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
   });
 
-  it("✓ seed_default_notification_preferences fires on company creation — all 4 event types, enabled by default", async () => {
+  it("✓ seed_default_notification_preferences fires on company creation — all 5 event types, enabled by default", async () => {
+    // 5, not 4 -- 'return_in_transit' was added 20260814
+    // (20260814160000_seed_return_in_transit_notification_preference.sql),
+    // backfilling every existing company and extending the seed trigger for
+    // new ones. Was silently missed in the migration that first added the
+    // type to the two CHECK constraints; this count would have caught that
+    // gap immediately had it been run before the follow-up fix.
     const { data, error } = await adminClient
       .from("notification_preferences")
       .select("event_type, enabled")
       .eq("company_id", companyA.id);
     expect(error).toBeNull();
-    expect(data?.length).toBe(4);
+    expect(data?.length).toBe(5);
+    expect(data?.map((row) => row.event_type).sort()).toEqual([
+      "checkin_received",
+      "checkin_sent",
+      "dispatched",
+      "order_confirmation",
+      "return_in_transit",
+    ]);
     expect(data?.every((row) => row.enabled === true)).toBe(true);
   });
 
@@ -2523,6 +2612,31 @@ describe("RLS: public.notification_preferences — read + toggle own company onl
       .eq("event_type", "dispatched")
       .single();
     expect(data?.enabled).toBe(true);
+  });
+
+  it("✓ a company admin can mute return_in_transit specifically, independent of the other 4 event types", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client
+      .from("notification_preferences")
+      .update({ enabled: false })
+      .eq("company_id", companyA.id)
+      .eq("event_type", "return_in_transit");
+    expect(error).toBeNull();
+
+    const { data: viaHelper } = await adminClient.rpc("notification_enabled", {
+      p_company_id: companyA.id,
+      p_event_type: "return_in_transit",
+    });
+    expect(viaHelper).toBe(false);
+
+    // Muting return_in_transit must not have touched any of the other 4 --
+    // same "one switch, one event type" guarantee the checkin_sent test
+    // above already established.
+    const { data: dispatchedEnabled } = await adminClient.rpc("notification_enabled", {
+      p_company_id: companyA.id,
+      p_event_type: "dispatched",
+    });
+    expect(dispatchedEnabled).toBe(true);
   });
 
   it("✓ notification_enabled() defaults true for an event_type with no row (pre-Phase-5 company)", async () => {

@@ -40,6 +40,18 @@
 // cross-function relative import). Revisit the shared-module pattern if a
 // future deploy needs it and the Supabase CLI is available instead of
 // MCP-based deploys.
+//
+// return_in_transit email (added 20260814): same trigger condition as the
+// webhook path (apply_sendcloud_poll_result reporting applied=true,
+// new_status='in_transit', leg='return' -- 'return' only ever comes back
+// when p_tracking_number matched return_tracking_number, so this can't
+// misfire against a ship_to_new_employee order's outbound leg, which has no
+// return leg at all per CLAUDE.md), fired via the same send-order-email
+// fetch pattern send-checkin-notifications already established. Unlike the
+// webhook path, this one has expected_delivery_date directly from its own
+// real, already-confirmed-working tracking-poll response parsing (top-level
+// field, confirmed present 20260814) -- no defensive fallback comment
+// needed here, it's the source that confirmed the field exists at all.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -123,6 +135,45 @@ interface SendcloudTrackingBlob {
   parcel_id: string;
   carrier_code: string;
   statuses: SendcloudTrackingStatus[];
+  // Top-level on the real v2 tracking-poll response -- confirmed present
+  // 20260814 against a real parcel (value was a carrier estimate, a day
+  // ahead of the parcel's actual delivery timestamp in that same test).
+  expected_delivery_date?: string;
+}
+
+interface ApplyPollResult {
+  matched: boolean;
+  order_id?: string;
+  leg?: "outbound" | "return";
+  applied?: boolean;
+  new_status?: string;
+  reason?: string;
+}
+
+// Fires the customer-facing "return in progress" email once, off the
+// courier's first scan on the return leg. Never throws -- a failure here is
+// reported to Sentry but must never fail the poll's own result payload back
+// to the Retool caller.
+async function triggerReturnInTransitEmail(orderId: string, estimatedArrivalDate: string | null): Promise<void> {
+  try {
+    const resp = await fetch(`${supabaseUrl}/functions/v1/send-order-email`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${serviceRoleKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ orderId, type: "return_in_transit", estimatedArrivalDate }),
+    });
+    if (!resp.ok) {
+      captureError(new Error(`send-order-email returned ${resp.status} for return_in_transit`), {
+        function: "poll-sendcloud-tracking",
+        orderId,
+        status: resp.status,
+      });
+    }
+  } catch (err) {
+    captureError(err, { function: "poll-sendcloud-tracking", orderId, step: "trigger return_in_transit email" });
+  }
 }
 
 Deno.serve(async (req: Request) => {
@@ -251,6 +302,11 @@ async function handleRequest(req: Request): Promise<Response> {
         captureError(applyError, { function: "poll-sendcloud-tracking", trackingNumber, orderId: order_id });
         results.push({ tracking_number: trackingNumber, error: applyError.message });
         continue;
+      }
+
+      const typedResult = applyResult as ApplyPollResult;
+      if (typedResult.applied && typedResult.new_status === "in_transit" && typedResult.leg === "return" && typedResult.order_id) {
+        await triggerReturnInTransitEmail(typedResult.order_id, blob.expected_delivery_date ?? null);
       }
 
       results.push({ tracking_number: trackingNumber, parent_status: latest.parent_status, ...applyResult });
