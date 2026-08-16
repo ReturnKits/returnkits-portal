@@ -518,14 +518,47 @@ function buildDispatchedEmail(props: {
 // keeps sending this every few days for as long as the order sits in
 // 'dispatched', which is the point -- reminders continue until it's
 // actually sent.
-function buildCheckinSentEmail(props: { companyName: string; reference: string; kitLabel: string }): string {
+//
+// The orderer isn't the one holding the device (the kit ships to the
+// employee's address, not theirs), so a bare "please post it back"
+// instruction doesn't fit them -- this is a visibility/escalation signal
+// for whoever's managing the offboarding, not a direct action request.
+// Added 20260816: the copy now tells the orderer whether the employee is
+// also being nudged directly, and if not, *why* -- three distinct states,
+// not one generic fallback, because the two "not notified" reasons are
+// different in kind: notify_off is the orderer's own choice at order
+// creation (nothing broken, they can act on it by following up
+// themselves), whereas no_email is a real data gap they could go fix
+// (add the employee's email to the directory) so notifications work
+// correctly going forward. Collapsing those two into one message would
+// have repeated the same inaccuracy problem the 'notified' claim itself
+// would have had if shown unconditionally.
+type CheckinSentEmployeeStatus = "notified" | "notify_off" | "no_email";
+
+function buildCheckinSentEmail(props: {
+  companyName: string;
+  reference: string;
+  kitLabel: string;
+  employeeName: string | null;
+  employeeStatus: CheckinSentEmployeeStatus;
+}): string {
+  const employeeDisplay = escapeHtml(props.employeeName ?? "the recipient");
+  const baseLine = `We haven't seen ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} come back to us yet.`;
+
+  let followUp: string;
+  if (props.employeeStatus === "notified") {
+    followUp = `We've also sent ${employeeDisplay} a reminder.`;
+  } else if (props.employeeStatus === "notify_off") {
+    followUp = `You may want to follow up with ${employeeDisplay} directly — employee notifications weren't turned on for this order.`;
+  } else {
+    followUp = `You may want to follow up with ${employeeDisplay} directly — we don't have an email on file for them.`;
+  }
+
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
     <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
     <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-      We haven't seen ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} come back to us yet.
-      When you get a chance, please post it back using the prepaid label included in the original kit —
-      no need to let us know, we'll take it from there once it arrives.
+      ${baseLine} ${followUp} We'll take it from there once it arrives — no need to let us know.
     </p>
   `;
   return layout(`Reminder: please send your kit back — ${props.reference}`, body);
@@ -998,7 +1031,24 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   } else if (type === "checkin_sent") {
     subject = `Reminder: please send your kit back — ${o.reference}`;
-    html = buildCheckinSentEmail({ companyName: o.company.name, reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit" });
+    // Mirrors sendEmployeeCopy()'s own eligibility check (notify_employee +
+    // employee has an email) but doesn't wait for that send to actually
+    // happen -- this only needs to know whether the system is configured to
+    // also nudge the employee, not confirm delivery, consistent with how
+    // this codebase doesn't retroactively reconcile customer-facing copy
+    // against downstream delivery outcomes anywhere else either.
+    const employeeStatus: CheckinSentEmployeeStatus = !o.notify_employee
+      ? "notify_off"
+      : resolvedEmployee.email
+        ? "notified"
+        : "no_email";
+    html = buildCheckinSentEmail({
+      companyName: o.company.name,
+      reference: o.reference,
+      kitLabel: o.kit_types?.label ?? "Kit",
+      employeeName: resolvedEmployee.name,
+      employeeStatus,
+    });
   } else if (type === "checkin_received") {
     subject = `Has your kit arrived? — ${o.reference}`;
     html = buildCheckinReceivedEmail({ companyName: o.company.name, reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit" });
