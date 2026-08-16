@@ -52,6 +52,26 @@
 // real, already-confirmed-working tracking-poll response parsing (top-level
 // field, confirmed present 20260814) -- no defensive fallback comment
 // needed here, it's the source that confirmed the field exists at all.
+//
+// Scheduled/batch mode (added 20260814, migration
+// 20260814170000_scheduled_sendcloud_tracking_poll.sql): this function now
+// serves two callers behind the same auth boundary. A request body with
+// `order_id` (and, as before, a real `actor_id`) is the existing
+// human-triggered "Check Tracking Now" path from Retool. A request body
+// WITHOUT `order_id` is the new pg_cron-triggered hourly path
+// (trigger_scheduled_tracking_poll(), via net.http_post) -- it calls
+// orders_needing_tracking_poll() to get every order that's currently
+// `dispatched`/`in_transit` with at least one tracking number, and polls
+// all of them in one invocation. `actor_id` is deliberately never required
+// or used in this mode -- there is no human behind a scheduled run, so
+// `p_actor_id: null` is passed straight through to
+// apply_sendcloud_poll_result(), which now treats a null actor as
+// "system-triggered" (same convention apply_sendcloud_tracking_event's
+// webhook path already uses) rather than raising the
+// assert_internal_actor() error a stale/placeholder actor_id would trigger.
+// Both paths share the same per-tracking-number Sendcloud-calling logic
+// (pollOneTrackingNumber below) -- extracted specifically so this
+// duplication never has to happen, not as a preemptive abstraction.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -153,7 +173,7 @@ interface ApplyPollResult {
 // Fires the customer-facing "return in progress" email once, off the
 // courier's first scan on the return leg. Never throws -- a failure here is
 // reported to Sentry but must never fail the poll's own result payload back
-// to the Retool caller.
+// to the caller (Retool, or the scheduled job).
 async function triggerReturnInTransitEmail(orderId: string, estimatedArrivalDate: string | null): Promise<void> {
   try {
     const resp = await fetch(`${supabaseUrl}/functions/v1/send-order-email`, {
@@ -173,6 +193,76 @@ async function triggerReturnInTransitEmail(orderId: string, estimatedArrivalDate
     }
   } catch (err) {
     captureError(err, { function: "poll-sendcloud-tracking", orderId, step: "trigger return_in_transit email" });
+  }
+}
+
+// Polls Sendcloud for one tracking number and applies the result to one
+// order. Shared by both the single-order (Retool, real actor_id) and
+// scheduled/batch (pg_cron, actor_id null) callers -- extracted so the
+// Sendcloud-calling and result-parsing logic exists exactly once. Never
+// throws -- every failure mode is folded into the returned result object,
+// same contract the original inline loop had.
+async function pollOneTrackingNumber(
+  orderId: string,
+  actorId: string | null,
+  trackingNumber: string,
+  basicAuth: string
+): Promise<Record<string, unknown>> {
+  try {
+    const sendcloudRes = await fetch(`https://panel.sendcloud.sc/api/v2/tracking/${encodeURIComponent(trackingNumber)}`, {
+      method: "GET",
+      headers: { Authorization: `Basic ${basicAuth}` },
+    });
+
+    if (sendcloudRes.status === 404) {
+      return { tracking_number: trackingNumber, error: "not found in Sendcloud (404)" };
+    }
+    if (sendcloudRes.status === 429) {
+      return { tracking_number: trackingNumber, error: "Sendcloud rate limit (429) -- try again shortly" };
+    }
+    if (!sendcloudRes.ok) {
+      return { tracking_number: trackingNumber, error: `Sendcloud returned ${sendcloudRes.status}` };
+    }
+
+    const blob: SendcloudTrackingBlob = await sendcloudRes.json();
+    if (!blob.statuses || blob.statuses.length === 0) {
+      return { tracking_number: trackingNumber, error: "no status history yet" };
+    }
+
+    // NOT newest-first: live-tested 2026-08-13 against a real delivered
+    // parcel and found statuses[] is actually OLDEST-first in practice
+    // (index 0 was "no-label" from days earlier, the "delivered" entries
+    // were last) -- the opposite of what Sendcloud's own OpenAPI example
+    // ordering suggested. Don't trust array position at all; pick by the
+    // latest carrier_update_timestamp explicitly.
+    const latest = blob.statuses.reduce((a, b) =>
+      new Date(b.carrier_update_timestamp).getTime() > new Date(a.carrier_update_timestamp).getTime() ? b : a
+    );
+
+    const { data: applyResult, error: applyError } = await supabase.rpc("apply_sendcloud_poll_result", {
+      p_order_id: orderId,
+      p_actor_id: actorId,
+      p_tracking_number: trackingNumber,
+      p_carrier_code: latest.carrier_code || blob.carrier_code,
+      p_parent_status: latest.parent_status,
+      p_status_description: latest.carrier_message || null,
+      p_event_at: latest.carrier_update_timestamp,
+    });
+
+    if (applyError) {
+      captureError(applyError, { function: "poll-sendcloud-tracking", trackingNumber, orderId });
+      return { tracking_number: trackingNumber, error: applyError.message };
+    }
+
+    const typedResult = applyResult as ApplyPollResult;
+    if (typedResult.applied && typedResult.new_status === "in_transit" && typedResult.leg === "return" && typedResult.order_id) {
+      await triggerReturnInTransitEmail(typedResult.order_id, blob.expected_delivery_date ?? null);
+    }
+
+    return { tracking_number: trackingNumber, parent_status: latest.parent_status, ...(applyResult as object) };
+  } catch (err) {
+    captureError(err, { function: "poll-sendcloud-tracking", trackingNumber, orderId });
+    return { tracking_number: trackingNumber, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -209,7 +299,16 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   const { order_id, actor_id } = body;
-  if (!order_id || !actor_id) {
+
+  // No order_id -- this is the scheduled/batch path (pg_cron via
+  // trigger_scheduled_tracking_poll(), body is always '{}'). order_id
+  // present -- the existing single-order, human-triggered "Check Tracking
+  // Now" path, which still requires a real actor_id exactly as before.
+  if (!order_id) {
+    return await handleScheduledBatch();
+  }
+
+  if (!actor_id) {
     return new Response(JSON.stringify({ error: "order_id and actor_id are both required" }), { status: 400 });
   }
 
@@ -250,73 +349,73 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   const basicAuth = btoa(`${creds.public_key}:${creds.secret_key}`);
-  const results: unknown[] = [];
+  const results: Record<string, unknown>[] = [];
 
   for (const trackingNumber of trackingNumbers) {
-    try {
-      const sendcloudRes = await fetch(`https://panel.sendcloud.sc/api/v2/tracking/${encodeURIComponent(trackingNumber)}`, {
-        method: "GET",
-        headers: { Authorization: `Basic ${basicAuth}` },
-      });
-
-      if (sendcloudRes.status === 404) {
-        results.push({ tracking_number: trackingNumber, error: "not found in Sendcloud (404)" });
-        continue;
-      }
-      if (sendcloudRes.status === 429) {
-        results.push({ tracking_number: trackingNumber, error: "Sendcloud rate limit (429) -- try again shortly" });
-        continue;
-      }
-      if (!sendcloudRes.ok) {
-        results.push({ tracking_number: trackingNumber, error: `Sendcloud returned ${sendcloudRes.status}` });
-        continue;
-      }
-
-      const blob: SendcloudTrackingBlob = await sendcloudRes.json();
-      if (!blob.statuses || blob.statuses.length === 0) {
-        results.push({ tracking_number: trackingNumber, error: "no status history yet" });
-        continue;
-      }
-
-      // NOT newest-first: live-tested 2026-08-13 against a real delivered
-      // parcel and found statuses[] is actually OLDEST-first in practice
-      // (index 0 was "no-label" from days earlier, the "delivered" entries
-      // were last) -- the opposite of what Sendcloud's own OpenAPI example
-      // ordering suggested. Don't trust array position at all; pick by the
-      // latest carrier_update_timestamp explicitly.
-      const latest = blob.statuses.reduce((a, b) =>
-        new Date(b.carrier_update_timestamp).getTime() > new Date(a.carrier_update_timestamp).getTime() ? b : a
-      );
-
-      const { data: applyResult, error: applyError } = await supabase.rpc("apply_sendcloud_poll_result", {
-        p_order_id: order_id,
-        p_actor_id: actor_id,
-        p_tracking_number: trackingNumber,
-        p_carrier_code: latest.carrier_code || blob.carrier_code,
-        p_parent_status: latest.parent_status,
-        p_status_description: latest.carrier_message || null,
-        p_event_at: latest.carrier_update_timestamp,
-      });
-
-      if (applyError) {
-        captureError(applyError, { function: "poll-sendcloud-tracking", trackingNumber, orderId: order_id });
-        results.push({ tracking_number: trackingNumber, error: applyError.message });
-        continue;
-      }
-
-      const typedResult = applyResult as ApplyPollResult;
-      if (typedResult.applied && typedResult.new_status === "in_transit" && typedResult.leg === "return" && typedResult.order_id) {
-        await triggerReturnInTransitEmail(typedResult.order_id, blob.expected_delivery_date ?? null);
-      }
-
-      results.push({ tracking_number: trackingNumber, parent_status: latest.parent_status, ...applyResult });
-    } catch (err) {
-      captureError(err, { function: "poll-sendcloud-tracking", trackingNumber, orderId: order_id });
-      results.push({ tracking_number: trackingNumber, error: err instanceof Error ? err.message : String(err) });
-    }
+    results.push(await pollOneTrackingNumber(order_id, actor_id, trackingNumber, basicAuth));
   }
 
   return new Response(JSON.stringify({ order_id, reference: order.reference, results }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+interface EligibleOrder {
+  order_id: string;
+  reference: string;
+  outbound_tracking_number: string | null;
+  return_tracking_number: string | null;
+}
+
+// The scheduled/batch path: no order_id in the request, no human actor.
+// Called hourly by trigger_scheduled_tracking_poll() via pg_cron/pg_net.
+// Fetches every order orders_needing_tracking_poll() reports as eligible
+// (fulfilment_status in dispatched/in_transit, at least one tracking
+// number), polls each of that order's tracking numbers exactly once via
+// the same pollOneTrackingNumber() the manual path uses, with
+// actorId: null throughout -- apply_sendcloud_poll_result() treats a null
+// actor as system-triggered rather than raising the internal-staff check a
+// stale/placeholder actor_id would otherwise hit.
+async function handleScheduledBatch(): Promise<Response> {
+  const { data: eligibleOrders, error: eligibleError } = await supabase.rpc("orders_needing_tracking_poll");
+  if (eligibleError) {
+    captureError(eligibleError, { function: "poll-sendcloud-tracking", step: "orders_needing_tracking_poll" });
+    return new Response(JSON.stringify({ error: eligibleError.message }), { status: 500 });
+  }
+
+  const orders = (eligibleOrders ?? []) as EligibleOrder[];
+  if (orders.length === 0) {
+    return new Response(JSON.stringify({ scheduled: true, orders_polled: 0, results: [] }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  const { data: creds, error: credsError } = await supabase.rpc("get_sendcloud_api_credentials");
+  if (credsError || !creds?.public_key || !creds?.secret_key) {
+    captureError(credsError ?? new Error("poll-sendcloud-tracking: Sendcloud API credentials not available in Vault"), {
+      function: "poll-sendcloud-tracking",
+      step: "scheduled batch",
+    });
+    return new Response(JSON.stringify({ error: "Sendcloud API credentials not configured" }), { status: 500 });
+  }
+  const basicAuth = btoa(`${creds.public_key}:${creds.secret_key}`);
+
+  const results: { order_id: string; reference: string; tracking_results: Record<string, unknown>[] }[] = [];
+
+  for (const order of orders) {
+    const trackingNumbers = Array.from(
+      new Set([order.outbound_tracking_number, order.return_tracking_number].filter((tn): tn is string => !!tn))
+    );
+    const trackingResults: Record<string, unknown>[] = [];
+    for (const trackingNumber of trackingNumbers) {
+      trackingResults.push(await pollOneTrackingNumber(order.order_id, null, trackingNumber, basicAuth));
+    }
+    results.push({ order_id: order.order_id, reference: order.reference, tracking_results: trackingResults });
+  }
+
+  return new Response(JSON.stringify({ scheduled: true, orders_polled: orders.length, results }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

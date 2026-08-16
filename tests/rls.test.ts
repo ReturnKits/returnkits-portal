@@ -1893,12 +1893,18 @@ describe("apply_sendcloud_poll_result() — 'Check Tracking Now' pull fallback (
   // after live-testing found sendcloud_webhook_events sits at zero rows --
   // no webhook has ever actually reached this system. See migration
   // 20260813200000_sendcloud_poll_fallback.sql. Looked up by order_id
-  // (not a tracking-number scan), staff-actor-attributed (never a null
-  // actor_id like the webhook path), and keyed off
-  // sendcloud_poll_status_map's parent_status vocabulary, not
-  // sendcloud_status_map's status_code vocabulary -- confirmed via source
-  // to be genuinely different API surfaces, not a naming variant of the
-  // same thing.
+  // (not a tracking-number scan), and keyed off sendcloud_poll_status_map's
+  // parent_status vocabulary, not sendcloud_status_map's status_code
+  // vocabulary -- confirmed via source to be genuinely different API
+  // surfaces, not a naming variant of the same thing.
+  //
+  // Originally staff-actor-attributed only (never a null actor_id like the
+  // webhook path) -- widened 20260814 (migration
+  // 20260814170000_scheduled_sendcloud_tracking_poll.sql) to also accept a
+  // null actor_id for the new hourly scheduled poll, which has no human
+  // behind it. This describe block's tests below all still use a real
+  // staffId (the human-triggered "Check Tracking Now" path is unchanged);
+  // the null-actor scheduled path gets its own describe block further down.
   let company: { id: string };
   const custEmail = uniqueEmail("p6-poll-cust");
   const staffEmail = uniqueEmail("p6-poll-staff");
@@ -2106,12 +2112,182 @@ describe("apply_sendcloud_poll_result() — 'Check Tracking Now' pull fallback (
   });
 });
 
-describe("Security: internal-only SECURITY DEFINER functions never leak EXECUTE to anon/authenticated -- poll feature additions (20260813)", () => {
-  it("✗ get_sendcloud_api_credentials and apply_sendcloud_poll_result grant no EXECUTE to anon or authenticated", async () => {
+describe("apply_sendcloud_poll_result() — null actor_id for the scheduled/hourly poll (20260814)", () => {
+  // The design decision this migration exists to resolve: a pg_cron
+  // -triggered scheduled poll has no human behind it, so there is no real
+  // internal-staff actor_id to supply. Rather than invent a fake "system"
+  // staff user (blocked anyway -- public.users.id has a hard FK to
+  // auth.users(id)), p_actor_id is now accepted as null and treated as
+  // "system-triggered", the same convention apply_sendcloud_tracking_event's
+  // webhook path already used. This block proves both directions: a null
+  // actor is accepted and tagged 'scheduled_poll' (never raising the
+  // internal-staff check), and a real-but-invalid actor_id is still
+  // rejected exactly as before -- the widening only ever makes an
+  // exception for null, not for "any UUID that happens not to validate."
+  let company: { id: string };
+  const custEmail = uniqueEmail("p6-scheduledpoll-cust");
+  let employee: { id: string };
+  let orderId: string;
+  const tracking = `SCHEDPOLL-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Scheduled Poll Test Co");
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Scheduled Poll Test", email: "scheduledpoll@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const client = await clientAsUser(custEmail);
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (shipError) throw shipError;
+    orderId = shipId as string;
+
+    await adminClient.from("orders").update({ fulfilment_status: "dispatched", outbound_tracking_number: tracking }).eq("id", orderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    await deleteAuthUserByEmail(custEmail);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a non-null but invalid actor_id is still rejected — the null exception isn't a blanket bypass", async () => {
+    const { error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: orderId,
+      p_actor_id: "00000000-0000-0000-0000-000000000000",
+      p_tracking_number: tracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ a null actor_id is accepted, transitions the order, and is tagged 'scheduled_poll' with a null actor_id in the log", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: orderId,
+      p_actor_id: null,
+      p_tracking_number: tracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.new_status).toBe("in_transit");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", orderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("in_transit");
+    const log = order?.fulfilment_log as Array<{ action: string; actor_id: string | null; detail: { source?: string } }>;
+    const entry = log.find((e) => e.action === "in_transit");
+    expect(entry?.actor_id).toBeNull();
+    expect(entry?.detail.source).toBe("scheduled_poll");
+  });
+});
+
+describe("orders_needing_tracking_poll() — eligible-orders helper for the scheduled poll (20260814)", () => {
+  let company: { id: string };
+  const custEmail = uniqueEmail("p6-eligible-cust");
+  let employee: { id: string };
+  let eligibleOrderId: string;
+  let noTrackingOrderId: string;
+  let completedOrderId: string;
+  const tracking = `ELIGIBLE-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Eligible Poll Test Co");
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Eligible Poll Test", email: "eligiblepoll@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const client = await clientAsUser(custEmail);
+
+    const { data: eligibleId, error: eligibleError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (eligibleError) throw eligibleError;
+    eligibleOrderId = eligibleId as string;
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: tracking })
+      .eq("id", eligibleOrderId);
+
+    const { data: noTrackingId, error: noTrackingError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (noTrackingError) throw noTrackingError;
+    noTrackingOrderId = noTrackingId as string;
+    // Dispatched but no tracking number set -- not eligible, nothing to poll.
+    await adminClient.from("orders").update({ fulfilment_status: "dispatched" }).eq("id", noTrackingOrderId);
+
+    const { data: completedId, error: completedError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (completedError) throw completedError;
+    completedOrderId = completedId as string;
+    // Completed with a tracking number still on it -- not eligible, done.
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "completed", outbound_tracking_number: `DONE-${Date.now()}` })
+      .eq("id", completedOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    await deleteAuthUserByEmail(custEmail);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✓ includes a dispatched order with a tracking number, excludes one with no tracking number and one already completed", async () => {
+    const { data, error } = await adminClient.rpc("orders_needing_tracking_poll");
+    expect(error).toBeNull();
+    const ids = (data as Array<{ order_id: string }>).map((r) => r.order_id);
+    expect(ids).toContain(eligibleOrderId);
+    expect(ids).not.toContain(noTrackingOrderId);
+    expect(ids).not.toContain(completedOrderId);
+  });
+});
+
+describe("Security: internal-only SECURITY DEFINER functions never leak EXECUTE to anon/authenticated -- poll feature additions (20260813, extended 20260814)", () => {
+  it("✗ get_sendcloud_api_credentials, apply_sendcloud_poll_result, and the scheduled-poll functions grant no EXECUTE to anon or authenticated", async () => {
     const { data: leaks, error: leakError } = await adminClient
       .from("internal_function_grant_leaks")
       .select("routine_name, grantee")
-      .in("routine_name", ["get_sendcloud_api_credentials", "apply_sendcloud_poll_result"]);
+      .in("routine_name", [
+        "get_sendcloud_api_credentials",
+        "apply_sendcloud_poll_result",
+        "trigger_scheduled_tracking_poll",
+        "orders_needing_tracking_poll",
+      ]);
     expect(leakError).toBeNull();
     expect(leaks).toEqual([]);
   });
