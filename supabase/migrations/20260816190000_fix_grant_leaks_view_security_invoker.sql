@@ -1,0 +1,18 @@
+-- Self-inflicted regression #1, found and fixed within the same working
+-- session as 20260816180000: dropping and recreating
+-- internal_function_grant_leaks left it on Postgres's default view
+-- behaviour (security_invoker = false), which runs the view with the
+-- OWNER's privileges rather than the querying role's own. Supabase's
+-- security advisor immediately flagged this as a NEW security_definer_view
+-- finding at ERROR severity -- the highest level the linter has, worse than
+-- any of the findings the previous migration was fixing. Caught via a fresh
+-- get_advisors(type: "security") scan run immediately after applying
+-- 20260816180000, before reporting anything back as done.
+--
+-- The original view (created in 20260813170000/20260813175513) never had
+-- this problem because `create or replace view` on a table that already had
+-- security_invoker set preserves it; only a fresh `drop` + `create` resets
+-- it to the default. Fixed here rather than folded into 20260816180000 to
+-- keep each hosted apply_migration call independently verifiable, matching
+-- how this fix was actually discovered and applied.
+alter view public.internal_function_grant_leaks set (security_invoker = true);

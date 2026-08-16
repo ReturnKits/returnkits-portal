@@ -1,0 +1,18 @@
+-- Self-inflicted regression #2, found and fixed within the same working
+-- session as 20260816180000/20260816190000: dropping and recreating
+-- internal_function_grant_leaks also reset it to Supabase's default
+-- public-schema grants, handing anon/authenticated SELECT (and other
+-- privileges) on the view itself. The original view's own comment
+-- (20260813170000) documented "No grants are given to anon/authenticated on
+-- the view itself ... so it can't be used to fingerprint the schema from
+-- outside either" -- this directly contradicted that property, and unlike
+-- the security_invoker regression, get_advisors' security lint does not
+-- check view-level table_privileges, so this one was caught only by
+-- proactively querying information_schema.table_privileges directly rather
+-- than waiting on a lint finding.
+--
+-- Confirmed empirically before and after: querying
+-- information_schema.table_privileges for this view with
+-- grantee in ('anon','authenticated') returned rows before this migration,
+-- and an empty result after.
+revoke all on public.internal_function_grant_leaks from anon, authenticated;

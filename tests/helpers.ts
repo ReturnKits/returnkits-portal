@@ -26,6 +26,14 @@ export const adminClient: SupabaseClient = createClient(SUPABASE_URL, SERVICE_RO
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
+// Unauthenticated (anon key, no session) — for proving something is
+// genuinely unreachable by a caller with no credentials at all, as opposed
+// to merely unreachable by a signed-in company user. Added 20260816 for the
+// internal_function_grant_leaks view-grant regression test.
+export const anonClient: SupabaseClient = createClient(SUPABASE_URL, ANON_KEY!, {
+  auth: { autoRefreshToken: false, persistSession: false },
+});
+
 export async function createCompany(name: string) {
   const { data, error } = await adminClient.from("companies").insert({ name }).select().single();
   if (error) throw error;

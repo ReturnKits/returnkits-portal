@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import crypto from "node:crypto";
 import {
   adminClient,
+  anonClient,
   clientAsUser,
   createAuthUser,
   createCompany,
@@ -3555,6 +3556,62 @@ describe("Security: internal-only SECURITY DEFINER functions never leak EXECUTE 
       .in("routine_name", internalOnlyFunctions);
     expect(leakError).toBeNull();
     expect(leaks).toEqual([]);
+  });
+});
+
+describe("Security: internal_function_grant_leaks rebuilt as a dynamic, self-maintaining check (20260816)", () => {
+  // The two describe blocks above both rely on someone remembering to add
+  // every new internal-only function's name to a hand-maintained list --
+  // which is exactly how create_internal_order, on_order_dispatched_send_email,
+  // on_order_paid_send_confirmation, and trigger_scheduled_tracking_poll all
+  // silently reacquired leaked anon/authenticated EXECUTE grants after the
+  // 20260813 fix: none of them were ever added to internalOnlyFunctions above
+  // (some didn't exist yet when that list was written). Worst finding this
+  // round: trigger_scheduled_tracking_poll had EXECUTE granted to anon with
+  // no internal-caller check in its body -- live-exploitable by anyone
+  // holding just the public anon key. Found by a direct security-audit-
+  // readiness review, not by either existing test above -- proving the
+  // fixed-list approach itself was the gap.
+  //
+  // Fixed in 20260816180000_lock_down_second_round_leaked_grants_and_dynamic_check.sql,
+  // which rebuilt internal_function_grant_leaks from scratch: it's no longer
+  // a curated list of function names, it's now driven directly by
+  // pg_proc.prosecdef (every SECURITY DEFINER function in the public schema,
+  // automatically) minus a short explicit allowlist of the handful genuinely
+  // meant to be called directly by a signed-in portal user (create_order,
+  // accept_invite, etc.). A new function added later with a leaked grant
+  // shows up here with zero test-file maintenance required.
+  //
+  // Two regressions were introduced and caught while building this fix, both
+  // now covered by the second test below: recreating the view reset it to
+  // Postgres's default security-invoker-off behaviour (a NEW
+  // security_definer_view lint finding, fixed via
+  // 20260816190000_fix_grant_leaks_view_security_invoker.sql), and separately
+  // reset it to Supabase's default public-schema grants, handing
+  // anon/authenticated SELECT on the view itself -- directly contradicting
+  // the "no grants on the view itself" property the comment above already
+  // documented (fixed via
+  // 20260816200000_revoke_default_grants_on_grant_leaks_view.sql).
+  it("✗ zero SECURITY DEFINER functions in public leak EXECUTE to anon/authenticated, full stop -- no name list to maintain", async () => {
+    const { data: leaks, error: leakError } = await adminClient
+      .from("internal_function_grant_leaks")
+      .select("routine_name, grantee");
+    expect(leakError).toBeNull();
+    expect(leaks).toEqual([]);
+  });
+
+  it("✗ the view itself grants nothing to anon or authenticated -- proven with a genuine anon-key client, not just a catalog query", async () => {
+    // adminClient bypasses RLS/grants entirely (service_role), so it can't
+    // prove this on its own -- the earlier direct information_schema query
+    // done at fix time (see CLAUDE.md) confirmed the grant is absent, but a
+    // real credential-less client hitting a real permission error is the
+    // stronger, harder-to-fool proof, and is what actually matters: could an
+    // outside caller with just the public anon key read this view (and
+    // through it, fingerprint every internal-only function name in the
+    // schema)?
+    const { data, error } = await anonClient.from("internal_function_grant_leaks").select("*").limit(1);
+    expect(data).toBeNull();
+    expect(error).not.toBeNull();
   });
 });
 
