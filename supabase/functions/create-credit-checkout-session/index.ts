@@ -19,12 +19,96 @@
 // confirms payment. If this function crashes, times out, or the customer
 // just closes the tab, nothing in our database has changed.
 //
+// Enterprise pricing (added 20260819): when the buying company has
+// companies.enterprise_pricing_enabled=true and the kit type is Laptop,
+// the per-unit price comes from enterprise_pricing_tiers instead of the
+// flat kit_types.price_ex_vat_pence -- the highest min_quantity tier whose
+// threshold the requested quantity meets or exceeds wins, applied to every
+// unit in this one purchase (per-purchase tiering, not cumulative lifetime
+// volume -- see CLAUDE.md/the schema migration for why). Every Enterprise
+// tier bundles Enhanced Cover into the price already; nothing extra is
+// added to the Stripe line item for that -- see create_order/
+// create_internal_order for where the bundled cover is actually attached,
+// at redemption time, not at purchase time.
+//
 // Required secrets: STRIPE_SECRET_KEY. SUPABASE_URL / SUPABASE_ANON_KEY
 // are provided automatically.
 
 import Stripe from "npm:stripe@17.5.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { captureError } from "../_shared/sentry.ts";
+
+// Inlined from ../_shared/sentry.ts -- the deploy_edge_function MCP tool
+// doesn't reliably bundle that cross-function relative import (repeated
+// deploys fail with "Module not found" even with the shared file included
+// in the payload). Same fix already applied to send-order-email,
+// generate-print-pack, export-orders-email, generate-invoice-pdf, and
+// sendcloud-webhook -- see CLAUDE.md.
+const SENTRY_DSN = Deno.env.get("SENTRY_DSN");
+
+function parseDsn(dsn: string): { host: string; projectId: string; publicKey: string } | null {
+  try {
+    const url = new URL(dsn);
+    const publicKey = url.username;
+    const projectId = url.pathname.replace(/^\//, "");
+    if (!publicKey || !projectId) return null;
+    return { host: url.host, projectId, publicKey };
+  } catch {
+    return null;
+  }
+}
+
+const sentryParsed = SENTRY_DSN ? parseDsn(SENTRY_DSN) : null;
+
+function sentryEventId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function captureError(
+  err: unknown,
+  context: { function: string; [key: string]: unknown } = { function: "unknown" },
+): void {
+  console.error(`[${context.function}]`, err);
+  if (!sentryParsed) return;
+
+  const error = err instanceof Error ? err : new Error(typeof err === "string" ? err : JSON.stringify(err));
+  const { function: fnName, ...extra } = context;
+
+  const event = {
+    event_id: sentryEventId(),
+    timestamp: new Date().toISOString(),
+    platform: "other",
+    level: "error",
+    logger: "edge-function",
+    server_name: fnName,
+    environment: Deno.env.get("SENTRY_ENVIRONMENT") ?? "production",
+    tags: { function: fnName },
+    extra,
+    exception: {
+      values: [
+        {
+          type: error.name || "Error",
+          value: error.message,
+          stacktrace: error.stack
+            ? { frames: error.stack.split("\n").map((line) => ({ filename: line.trim() })) }
+            : undefined,
+        },
+      ],
+    },
+  };
+
+  const endpoint = `https://${sentryParsed.host}/api/${sentryParsed.projectId}/store/`;
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Sentry-Auth": `Sentry sentry_version=7, sentry_key=${sentryParsed.publicKey}, sentry_client=returnkits-edge/1.0`,
+    },
+    body: JSON.stringify(event),
+  }).catch((sentryErr) => {
+    console.error(`[${fnName}] failed to report to Sentry:`, sentryErr);
+  });
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -54,6 +138,7 @@ type CompanyRow = {
   name: string;
   billing_email: string | null;
   stripe_customer_id: string | null;
+  enterprise_pricing_enabled: boolean;
 };
 
 type KitTypeRow = {
@@ -62,6 +147,11 @@ type KitTypeRow = {
   price_ex_vat_pence: number;
   vat_rate: string | number;
   active: boolean;
+};
+
+type EnterpriseTierRow = {
+  min_quantity: number;
+  price_ex_vat_pence: number;
 };
 
 Deno.serve(async (req: Request) => {
@@ -126,7 +216,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
   const { data: company, error: companyError } = await userClient
     .from("companies")
-    .select("id, name, billing_email, stripe_customer_id")
+    .select("id, name, billing_email, stripe_customer_id, enterprise_pricing_enabled")
     .single();
 
   if (companyError || !company) {
@@ -162,13 +252,44 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   }
 
-  // Same per-unit price as self-serve checkout — no bulk discount (v1 scope
-  // decision, 20260812). Rounded per unit, then multiplied by quantity via
-  // Stripe's own quantity field, matching how the invoice will read.
+  // Same per-unit price as self-serve checkout by default — no bulk discount
+  // (v1 scope decision, 20260812) — UNLESS this company has Enterprise
+  // pricing on and is buying Laptop credits, in which case the per-unit
+  // price comes from enterprise_pricing_tiers instead (see header comment).
+  let unitPriceExVatPence = kitTypeRow.price_ex_vat_pence;
+  let enterpriseTierApplied: EnterpriseTierRow | null = null;
+
+  if (companyRow.enterprise_pricing_enabled && kitTypeId === "laptop") {
+    const { data: tier, error: tierError } = await userClient
+      .from("enterprise_pricing_tiers")
+      .select("min_quantity, price_ex_vat_pence")
+      .eq("kit_type_id", kitTypeId)
+      .eq("active", true)
+      .lte("min_quantity", quantity)
+      .order("min_quantity", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (tierError) {
+      captureError(tierError, { function: "create-credit-checkout-session", step: "enterprise tier lookup" });
+      return new Response(JSON.stringify({ error: "Could not look up Enterprise pricing" }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    if (tier) {
+      enterpriseTierApplied = tier as EnterpriseTierRow;
+      unitPriceExVatPence = enterpriseTierApplied.price_ex_vat_pence;
+    }
+  }
+
+  // Rounded per unit, then multiplied by quantity via Stripe's own quantity
+  // field, matching how the invoice will read.
   const vatRate = Number(kitTypeRow.vat_rate ?? 0.2);
-  const unitVatPence = Math.round(kitTypeRow.price_ex_vat_pence * vatRate);
-  const unitIncVatPence = kitTypeRow.price_ex_vat_pence + unitVatPence;
-  const subtotalExVatPence = kitTypeRow.price_ex_vat_pence * quantity;
+  const unitVatPence = Math.round(unitPriceExVatPence * vatRate);
+  const unitIncVatPence = unitPriceExVatPence + unitVatPence;
+  const subtotalExVatPence = unitPriceExVatPence * quantity;
   const vatPence = unitVatPence * quantity;
   const totalIncVatPence = subtotalExVatPence + vatPence;
 
@@ -197,7 +318,11 @@ async function handleRequest(req: Request): Promise<Response> {
       {
         price_data: {
           currency: "gbp",
-          product_data: { name: `${quantity} × ${kitTypeRow.label} credit${quantity === 1 ? "" : "s"}` },
+          product_data: {
+            name: `${quantity} × ${kitTypeRow.label} credit${quantity === 1 ? "" : "s"}${
+              enterpriseTierApplied ? " (Enterprise pricing, includes Enhanced Cover)" : ""
+            }`,
+          },
           unit_amount: unitIncVatPence,
         },
         quantity,
@@ -213,6 +338,7 @@ async function handleRequest(req: Request): Promise<Response> {
       subtotal_ex_vat_pence: String(subtotalExVatPence),
       vat_pence: String(vatPence),
       total_inc_vat_pence: String(totalIncVatPence),
+      enterprise_tier_min_quantity: enterpriseTierApplied ? String(enterpriseTierApplied.min_quantity) : "",
     },
   });
 

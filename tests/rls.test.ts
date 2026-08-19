@@ -4662,3 +4662,297 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
     });
   });
 });
+
+describe("create_credit_order_with_paid_cover() — kit paid by credit, Enhanced Cover paid separately by card (20260819)", () => {
+  // Direct answer to a customer question: "why can't I add cover if I pay
+  // with credits?" Design confirmed with the user: rejected making credits
+  // Enterprise-only and rejected bundling a fixed free cover tier into
+  // every credit — chosen instead was real purchasable cover on a
+  // credit-paid order, charged separately by card. See
+  // 20260819220000_cover_paid_separately_on_credit_orders.sql and
+  // 20260819230000_create_credit_order_with_paid_cover_rpc.sql.
+  //
+  // This is the webhook-only RPC half of that flow — it's the only thing
+  // that ever inserts one of these orders, called from stripe-webhook
+  // after Stripe confirms the cover payment. Unlike every other credit
+  // redemption in this app, the credit_ledger debit AND the order insert
+  // both happen inside this one function, only once cover payment is
+  // already confirmed — there is deliberately no earlier "order created,
+  // awaiting cover payment" state to test, because that state doesn't
+  // exist in this design (see the migration's own reasoning for why).
+  let company: { id: string };
+  const ownerEmail = uniqueEmail("credcov-owner");
+  let ownerId: string;
+  let employee: { id: string };
+
+  beforeAll(async () => {
+    company = await createCompany("Credit+Cover Test Co");
+    const owner = await createAuthUser(ownerEmail);
+    ownerId = owner.id;
+    await createProfile(owner.id, company.id, ownerEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Cover Credit Employee", email: "credcov-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    await adminClient.from("credit_ledger").delete().eq("company_id", company.id);
+    await adminClient.from("invoices").delete().eq("company_id", company.id);
+    await deleteAuthUserByEmail(ownerEmail);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  async function balanceFor(kitTypeId: string): Promise<number> {
+    const { data, error } = await adminClient
+      .from("credit_ledger")
+      .select("direction, quantity")
+      .eq("company_id", company.id)
+      .eq("kit_type_id", kitTypeId);
+    if (error) throw error;
+    return (data ?? []).reduce((sum, row) => sum + (row.direction === "credit" ? row.quantity : -row.quantity), 0);
+  }
+
+  function baseArgs(overrides: Record<string, unknown> = {}) {
+    const stamp = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+    return {
+      p_event_id: `evt_credcov_${stamp}`,
+      p_event_type: "checkout.session.completed",
+      p_checkout_session_id: `cs_credcov_${stamp}`,
+      p_payment_intent_id: `pi_credcov_${stamp}`,
+      p_company_id: company.id,
+      p_created_by: ownerId,
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_cover_tier_id: "up_to_1000",
+      p_cover_subtotal_ex_vat_pence: 1000,
+      p_cover_vat_pence: 0,
+      p_cover_total_inc_vat_pence: 1000,
+      p_employee_id: employee.id,
+      ...overrides,
+    };
+  }
+
+  it("✗ an authenticated client cannot call create_credit_order_with_paid_cover directly", async () => {
+    // Same forgery risk as every other webhook-only RPC in this project —
+    // without the service_role guard, any signed-in customer could mint
+    // their own paid, cover-attached order for free.
+    await adminClient.from("credit_ledger").insert({
+      company_id: company.id,
+      kit_type_id: "laptop",
+      transaction_type: "purchase",
+      direction: "credit",
+      quantity: 1,
+      balance_after: (await balanceFor("laptop")) + 1,
+      reason: "seed for forgery-rejection test",
+    });
+
+    const client = await clientAsUser(ownerEmail);
+    const { error } = await client.rpc("create_credit_order_with_paid_cover", baseArgs());
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ rejects a null cover tier — this RPC's whole purpose requires one", async () => {
+    const { error } = await adminClient.rpc(
+      "create_credit_order_with_paid_cover",
+      baseArgs({ p_cover_tier_id: null }),
+    );
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ refuses when the credit balance is zero", async () => {
+    // The function raises at the balance check, well before it ever reads
+    // the cover subtotal/vat/total args (those are only used at the
+    // invoice-insert step, much later) — no need to make them add up here.
+    const { error } = await adminClient.rpc("create_credit_order_with_paid_cover", baseArgs({ p_kit_type_id: "monitor" }));
+    expect(error).not.toBeNull();
+
+    // Nothing half-happened — no order, no ledger row, for this rejected call.
+    const balance = await balanceFor("monitor");
+    expect(balance).toBe(0);
+  });
+
+  it("✓ service_role: creates the order fully paid, debits the credit ledger by one, and issues a cover-only invoice", async () => {
+    await adminClient.from("credit_ledger").insert({
+      company_id: company.id,
+      kit_type_id: "laptop",
+      transaction_type: "purchase",
+      direction: "credit",
+      quantity: 1,
+      balance_after: (await balanceFor("laptop")) + 1,
+      reason: "seed for successful redemption test",
+    });
+    const balanceBefore = await balanceFor("laptop");
+
+    const args = baseArgs();
+    const { data: orderId, error } = await adminClient.rpc("create_credit_order_with_paid_cover", args);
+    expect(error).toBeNull();
+    expect(orderId).not.toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select(
+        "payment_status, paid_with_credit, credit_transaction_id, cover_tier_id, cover_price_ex_vat_pence, " +
+          "cover_paid_separately, invoice_id, source",
+      )
+      .eq("id", orderId as string)
+      .single();
+    expect(order?.payment_status).toBe("paid");
+    expect(order?.paid_with_credit).toBe(true);
+    expect(order?.credit_transaction_id).not.toBeNull();
+    expect(order?.cover_tier_id).toBe("up_to_1000");
+    expect(order?.cover_price_ex_vat_pence).toBe(1000); // the real cover_tiers price — NOT zeroed like the Enterprise-bundled path
+    expect(order?.cover_paid_separately).toBe(true);
+    expect(order?.invoice_id).not.toBeNull();
+    expect(order?.source).toBe("customer");
+
+    const balanceAfter = await balanceFor("laptop");
+    expect(balanceAfter).toBe(balanceBefore - 1);
+
+    const { data: ledgerRow } = await adminClient
+      .from("credit_ledger")
+      .select("order_id")
+      .eq("id", order?.credit_transaction_id as string)
+      .single();
+    expect(ledgerRow?.order_id).toBe(orderId);
+
+    const { data: invoice } = await adminClient
+      .from("invoices")
+      .select("total_inc_vat_pence, stripe_checkout_session_id")
+      .eq("id", order?.invoice_id as string)
+      .single();
+    // The invoice covers ONLY the cover charge — the kit itself was never
+    // separately invoiced here, it was paid for when the credit was bought.
+    expect(invoice?.total_inc_vat_pence).toBe(1000);
+    expect(invoice?.stripe_checkout_session_id).toBe(args.p_checkout_session_id);
+  });
+
+  it("✓ replaying the same event id twice changes nothing", async () => {
+    await adminClient.from("credit_ledger").insert({
+      company_id: company.id,
+      kit_type_id: "laptop",
+      transaction_type: "purchase",
+      direction: "credit",
+      quantity: 1,
+      balance_after: (await balanceFor("laptop")) + 1,
+      reason: "seed for idempotency test",
+    });
+    const balanceBefore = await balanceFor("laptop");
+
+    const args = baseArgs();
+    const first = await adminClient.rpc("create_credit_order_with_paid_cover", args);
+    expect(first.error).toBeNull();
+    expect(first.data).not.toBeNull();
+
+    const second = await adminClient.rpc("create_credit_order_with_paid_cover", args);
+    expect(second.error).toBeNull();
+    expect(second.data).toBeNull(); // null signals "already processed", same convention as every other webhook RPC
+
+    // Exactly one debit, one invoice for this checkout session — replaying
+    // never double-spends or mints a second invoice.
+    const balanceAfter = await balanceFor("laptop");
+    expect(balanceAfter).toBe(balanceBefore - 1);
+
+    const { count: bySession } = await adminClient
+      .from("invoices")
+      .select("id", { count: "exact", head: true })
+      .eq("stripe_checkout_session_id", args.p_checkout_session_id);
+    expect(bySession).toBe(1);
+  });
+
+  // Both CHECK-constraint tests below insert a real credit_ledger row first
+  // to satisfy orders.credit_transaction_id's FK — same isolation pattern
+  // as the pre-existing "orders_credit_excludes_cover" constraint test
+  // above (Prepaid credits block): "isolated from the FK and the
+  // snapshot-consistency constraint (both satisfied here on purpose)."
+  // A fabricated random UUID would fail on the FK instead of (or as well
+  // as) the CHECK this test actually means to isolate.
+  async function seedLedgerRow(kitTypeId: string): Promise<string> {
+    const { data, error } = await adminClient
+      .from("credit_ledger")
+      .insert({
+        company_id: company.id,
+        kit_type_id: kitTypeId,
+        transaction_type: "redemption",
+        direction: "debit",
+        quantity: 1,
+        balance_after: 0,
+        reason: "seed for CHECK-constraint isolation test",
+      })
+      .select()
+      .single();
+    if (error) throw error;
+    return (data as { id: string }).id;
+  }
+
+  it("database constraint: a direct insert with paid_with_credit + a real cover price but cover_paid_separately=false is still rejected", async () => {
+    // Proves the widened orders_credit_excludes_cover CHECK didn't remove
+    // the original v1 protection for every OTHER code path — only the
+    // cover_paid_separately=true case (which only this RPC ever sets) is
+    // allowed through.
+    const ledgerId = await seedLedgerRow("laptop");
+    const { error } = await adminClient.from("orders").insert({
+      company_id: company.id,
+      reference: `RKL-260819-${Math.floor(Math.random() * 900 + 100)}`,
+      kit_type_id: "laptop",
+      service_type: "ship_to_new_employee",
+      source: "customer",
+      created_by: ownerId,
+      employee_id: employee.id,
+      price_ex_vat_pence: 6500,
+      payment_status: "paid",
+      paid_with_credit: true,
+      credit_transaction_id: ledgerId,
+      cover_tier_id: "up_to_500",
+      cover_price_ex_vat_pence: 500,
+      cover_paid_separately: false,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("database constraint: cover_paid_separately=true with no real cover charge is rejected (orders_cover_paid_separately_implies_real_cover)", async () => {
+    const zeroPriceLedgerId = await seedLedgerRow("laptop");
+    const { error: zeroPriceError } = await adminClient.from("orders").insert({
+      company_id: company.id,
+      reference: `RKL-260819-${Math.floor(Math.random() * 900 + 100)}`,
+      kit_type_id: "laptop",
+      service_type: "ship_to_new_employee",
+      source: "customer",
+      created_by: ownerId,
+      employee_id: employee.id,
+      price_ex_vat_pence: 6500,
+      payment_status: "paid",
+      paid_with_credit: true,
+      credit_transaction_id: zeroPriceLedgerId,
+      cover_tier_id: "up_to_500",
+      cover_price_ex_vat_pence: 0,
+      cover_paid_separately: true,
+    });
+    expect(zeroPriceError).not.toBeNull();
+
+    // This case is paid_with_credit=false, so no ledger row/FK is involved
+    // at all — it isolates the "cover_paid_separately=true requires a real
+    // cover_tier_id" half of the CHECK on its own.
+    const { error: noCoverError } = await adminClient.from("orders").insert({
+      company_id: company.id,
+      reference: `RKL-260819-${Math.floor(Math.random() * 900 + 100)}`,
+      kit_type_id: "laptop",
+      service_type: "ship_to_new_employee",
+      source: "customer",
+      created_by: ownerId,
+      employee_id: employee.id,
+      price_ex_vat_pence: 6500,
+      payment_status: "paid",
+      paid_with_credit: false,
+      cover_tier_id: null,
+      cover_price_ex_vat_pence: null,
+      cover_paid_separately: true,
+    });
+    expect(noCoverError).not.toBeNull();
+  });
+});

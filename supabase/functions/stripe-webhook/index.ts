@@ -10,9 +10,9 @@
 //      call = a single transaction. All the "does this still add up" /
 //      idempotency / atomicity logic lives there, not here.
 //
-// Three Checkout Session shapes reach this function, distinguished by
+// Four Checkout Session shapes reach this function, distinguished by
 // metadata.type (set by whichever create-*-session function created the
-// session — 20260812, credits system):
+// session):
 //
 //   'order_payment'   (default/legacy — sessions created before this field
 //                      existed have no metadata.type at all, so absence is
@@ -22,6 +22,15 @@
 //   'card_setup'      -> record_card_setup, then set the card as the
 //                        Stripe customer's default payment method so future
 //                        Checkout Sessions (buying more credits) preselect it
+//   'credit_order_cover_payment' (added 20260819 — kit paid by credit,
+//                      Enhanced Cover paid separately by card, same order)
+//                      -> create_credit_order_with_paid_cover, which debits
+//                        the credit ledger AND creates the order AND issues
+//                        the cover invoice, all in one transaction. Nothing
+//                        in the database exists for this order before this
+//                        branch runs — see create-credit-order-cover-
+//                        checkout-session's header comment for why that's
+//                        deliberate.
 //
 // Deliberately NOT using verify_jwt (deployed with verify_jwt: false) —
 // Stripe doesn't send a Supabase JWT, it sends its own signature. Trusting
@@ -39,7 +48,81 @@
 
 import Stripe from "npm:stripe@17.5.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
-import { captureError } from "../_shared/sentry.ts";
+
+// Inlined from ../_shared/sentry.ts — the deploy_edge_function MCP tool
+// doesn't reliably bundle that cross-function relative import (repeated
+// deploys fail with "Module not found" even with the shared file included
+// in the payload). Same fix already applied to send-order-email,
+// generate-print-pack, export-orders-email, generate-invoice-pdf,
+// sendcloud-webhook, and create-credit-checkout-session — applied here too
+// while touching this function for the credit_order_cover_payment branch
+// (20260819), rather than risk it on this deploy per CLAUDE.md's own note.
+const SENTRY_DSN = Deno.env.get("SENTRY_DSN");
+
+function parseDsn(dsn: string): { host: string; projectId: string; publicKey: string } | null {
+  try {
+    const url = new URL(dsn);
+    const publicKey = url.username;
+    const projectId = url.pathname.replace(/^\//, "");
+    if (!publicKey || !projectId) return null;
+    return { host: url.host, projectId, publicKey };
+  } catch {
+    return null;
+  }
+}
+
+const sentryParsed = SENTRY_DSN ? parseDsn(SENTRY_DSN) : null;
+
+function sentryEventId(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
+function captureError(
+  err: unknown,
+  context: { function: string; [key: string]: unknown } = { function: "unknown" },
+): void {
+  console.error(`[${context.function}]`, err);
+  if (!sentryParsed) return;
+
+  const error = err instanceof Error ? err : new Error(typeof err === "string" ? err : JSON.stringify(err));
+  const { function: fnName, ...extra } = context;
+
+  const event = {
+    event_id: sentryEventId(),
+    timestamp: new Date().toISOString(),
+    platform: "other",
+    level: "error",
+    logger: "edge-function",
+    server_name: fnName,
+    environment: Deno.env.get("SENTRY_ENVIRONMENT") ?? "production",
+    tags: { function: fnName },
+    extra,
+    exception: {
+      values: [
+        {
+          type: error.name || "Error",
+          value: error.message,
+          stacktrace: error.stack
+            ? { frames: error.stack.split("\n").map((line) => ({ filename: line.trim() })) }
+            : undefined,
+        },
+      ],
+    },
+  };
+
+  const endpoint = `https://${sentryParsed.host}/api/${sentryParsed.projectId}/store/`;
+
+  fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Sentry-Auth": `Sentry sentry_version=7, sentry_key=${sentryParsed.publicKey}, sentry_client=returnkits-edge/1.0`,
+    },
+    body: JSON.stringify(event),
+  }).catch((sentryErr) => {
+    console.error(`[${fnName}] failed to report to Sentry:`, sentryErr);
+  });
+}
 
 const stripeSecretKey = Deno.env.get("STRIPE_SECRET_KEY");
 const webhookSecret = Deno.env.get("STRIPE_WEBHOOK_SECRET");
@@ -63,9 +146,10 @@ const stripe = new Stripe(stripeSecretKey ?? "", {
 
 // service_role client: this is the ONE place in the whole app that's
 // meant to call record_stripe_payment / record_credit_purchase /
-// record_card_setup — see the lockdown migrations that revoke EXECUTE from
-// anon/authenticated specifically because only this function's identity
-// should ever reach them.
+// record_card_setup / create_credit_order_with_paid_cover — see the
+// lockdown migrations that revoke EXECUTE from anon/authenticated
+// specifically because only this function's identity should ever reach
+// them.
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
 Deno.serve(async (req: Request) => {
@@ -135,6 +219,8 @@ async function handleRequest(req: Request): Promise<Response> {
       return await handleCreditPurchase(event, session, metadata);
     case "card_setup":
       return await handleCardSetup(event, session, metadata);
+    case "credit_order_cover_payment":
+      return await handleCreditOrderCoverPayment(event, session, metadata);
     default:
       console.error("stripe-webhook: unrecognised metadata.type — refusing", {
         sessionId: session.id,
@@ -357,6 +443,107 @@ async function handleCardSetup(
   }
 
   return new Response(JSON.stringify({ received: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+async function handleCreditOrderCoverPayment(
+  event: Stripe.Event,
+  session: Stripe.Checkout.Session,
+  metadata: Record<string, string>,
+): Promise<Response> {
+  const companyId = metadata.company_id;
+  const createdBy = metadata.created_by;
+  const kitTypeId = metadata.kit_type_id;
+  const serviceType = metadata.service_type;
+  const coverTierId = metadata.cover_tier_id;
+  const subtotalExVatPence = Number(metadata.cover_subtotal_ex_vat_pence);
+  const vatPence = Number(metadata.cover_vat_pence);
+  const totalIncVatPence = Number(metadata.cover_total_inc_vat_pence);
+
+  if (
+    !companyId ||
+    !createdBy ||
+    !kitTypeId ||
+    !serviceType ||
+    !coverTierId ||
+    !Number.isFinite(subtotalExVatPence) ||
+    !Number.isFinite(vatPence) ||
+    !Number.isFinite(totalIncVatPence)
+  ) {
+    console.error(
+      "stripe-webhook: checkout.session.completed (credit_order_cover_payment) missing expected metadata",
+      { sessionId: session.id, metadata },
+    );
+    return new Response("Missing or malformed session metadata", { status: 400 });
+  }
+
+  // Same defence in depth as every other branch — refuse rather than trust
+  // metadata blindly if what Stripe actually collected doesn't match.
+  if (session.amount_total !== totalIncVatPence) {
+    console.error("stripe-webhook: amount_total does not match session metadata — refusing", {
+      sessionId: session.id,
+      amountTotal: session.amount_total,
+      metadataTotal: totalIncVatPence,
+    });
+    return new Response("Amount mismatch between Stripe session and metadata", { status: 400 });
+  }
+
+  // Empty-string metadata values (unused optional fields — see
+  // create-credit-order-cover-checkout-session) become null, not "", when
+  // handed to the RPC — the RPC's own guards expect null for "not provided".
+  const nullable = (v: string | undefined): string | null => (v && v.length > 0 ? v : null);
+
+  const { data: orderId, error } = await supabase.rpc("create_credit_order_with_paid_cover", {
+    p_event_id: event.id,
+    p_event_type: event.type,
+    p_checkout_session_id: session.id,
+    p_payment_intent_id: typeof session.payment_intent === "string" ? session.payment_intent : null,
+    p_company_id: companyId,
+    p_created_by: createdBy,
+    p_kit_type_id: kitTypeId,
+    p_service_type: serviceType,
+    p_cover_tier_id: coverTierId,
+    p_cover_subtotal_ex_vat_pence: subtotalExVatPence,
+    p_cover_vat_pence: vatPence,
+    p_cover_total_inc_vat_pence: totalIncVatPence,
+    p_employee_id: nullable(metadata.employee_id),
+    p_return_address_id: nullable(metadata.return_address_id),
+    p_device_reference: nullable(metadata.device_reference),
+    p_requested_send_date: nullable(metadata.requested_send_date),
+    p_leaver_last_day: nullable(metadata.leaver_last_day),
+    p_bundle_id: nullable(metadata.bundle_id),
+    p_order_reference: nullable(metadata.order_reference),
+    p_notify_employee: metadata.notify_employee === "1",
+    p_employee_name: nullable(metadata.employee_name),
+    p_employee_email: nullable(metadata.employee_email),
+    p_employee_address_line1: nullable(metadata.employee_address_line1),
+    p_employee_address_line2: nullable(metadata.employee_address_line2),
+    p_employee_city: nullable(metadata.employee_city),
+    p_employee_postcode: nullable(metadata.employee_postcode),
+    p_employee_country: nullable(metadata.employee_country),
+  });
+
+  if (error) {
+    captureError(new Error(`create_credit_order_with_paid_cover failed: ${error.message}`), {
+      function: "stripe-webhook",
+      sessionId: session.id,
+      eventId: event.id,
+    });
+    // Non-2xx tells Stripe to retry. Note the accepted edge case documented
+    // on the RPC's own migration: if this fails because the credit balance
+    // ran out between checkout-session creation and payment confirmation,
+    // retrying won't fix it — the cover charge already succeeded and needs
+    // a manual resolution in the Stripe dashboard, same as every other
+    // refund in this app.
+    return new Response(`create_credit_order_with_paid_cover failed: ${error.message}`, { status: 500 });
+  }
+
+  // orderId is null exactly when this event_id had already been processed
+  // (idempotent replay) — both cases are a success from Stripe's point of
+  // view.
+  return new Response(JSON.stringify({ received: true, orderId }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
