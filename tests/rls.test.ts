@@ -4956,3 +4956,229 @@ describe("create_credit_order_with_paid_cover() — kit paid by credit, Enhanced
     expect(noCoverError).not.toBeNull();
   });
 });
+
+describe("cancel_pending_order() — customer self-cancel before payment (20260819)", () => {
+  // Direct response to: "when customers create an order, the order is
+  // created first then they can pay for it after, before they can pay,
+  // give them the option to cancel." Separate function from the staff-only
+  // cancel_order() (service_role-gated, Retool-only) — this one is called
+  // from a new Edge Function (cancel-pending-order) rather than directly by
+  // the client.
+  //
+  // First design attempt (20260819240000) made this a plain
+  // `authenticated`-callable RPC deriving the caller from auth.uid(), same
+  // shape as create_order — but a live verification run against the hosted
+  // database (before anything was wired up in Lovable) found it hit
+  // enforce_orders_payment_fields_immutable_by_client(): a trigger on
+  // public.orders that unconditionally rejects any change to
+  // payment_status/invoice_id unless auth.role() = 'service_role'.
+  // 20260819250000_fix_cancel_pending_order_service_role_pattern.sql
+  // rebuilt it on cancel_order()'s own service_role + explicit p_actor_id
+  // shape instead — these tests exercise that corrected version, calling
+  // via adminClient (service_role) exactly the way the edge function does,
+  // plus a forgery-rejection test proving a signed-in customer's own
+  // session cannot call this RPC directly.
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const creatorEmail = uniqueEmail("cancelpend-creator");
+  const adminEmail = uniqueEmail("cancelpend-admin");
+  const colleagueEmail = uniqueEmail("cancelpend-colleague");
+  const bEmail = uniqueEmail("cancelpend-b");
+  let creatorId: string;
+  let adminId: string;
+  let colleagueId: string;
+  let bAdminId: string;
+  let employeeA: { id: string };
+
+  beforeAll(async () => {
+    companyA = await createCompany("Cancel Pending Test Co A");
+    companyB = await createCompany("Cancel Pending Test Co B");
+
+    const creator = await createAuthUser(creatorEmail);
+    creatorId = creator.id;
+    await createProfile(creator.id, companyA.id, creatorEmail, "company_member");
+
+    const admin = await createAuthUser(adminEmail);
+    adminId = admin.id;
+    await createProfile(admin.id, companyA.id, adminEmail, "company_admin");
+
+    const colleague = await createAuthUser(colleagueEmail);
+    colleagueId = colleague.id;
+    await createProfile(colleague.id, companyA.id, colleagueEmail, "company_member");
+
+    const b1 = await createAuthUser(bEmail);
+    bAdminId = b1.id;
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Cancel Pending Employee", email: "cancelpend-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("audit_log").delete().in("actor_id", [creatorId, adminId, colleagueId, bAdminId]);
+    await adminClient.from("orders").delete().eq("company_id", companyA.id);
+    for (const email of [creatorEmail, adminEmail, colleagueEmail, bEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  async function createPendingOrder(asEmail: string): Promise<string> {
+    const client = await clientAsUser(asEmail);
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+    });
+    if (error || !orderId) throw error ?? new Error("no order id returned");
+    return orderId as string;
+  }
+
+  it("✗ a signed-in customer cannot call cancel_pending_order directly — only the edge function's service_role key can", async () => {
+    // Same forgery risk as every other webhook/edge-function-only RPC in
+    // this project: without the service_role guard, any signed-in customer
+    // could cancel (or attempt to cancel) an order without going through
+    // the edge function's own identity check at all.
+    const orderId = await createPendingOrder(creatorEmail);
+    const client = await clientAsUser(creatorEmail);
+    const { error } = await client.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: creatorId,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("payment_status")
+      .eq("id", orderId)
+      .single();
+    expect(order?.payment_status).toBe("pending"); // untouched
+  });
+
+  it("✗ an unauthenticated (anon) client cannot call cancel_pending_order at all", async () => {
+    const orderId = await createPendingOrder(creatorEmail);
+    const { error } = await anonClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: creatorId,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("payment_status")
+      .eq("id", orderId)
+      .single();
+    expect(order?.payment_status).toBe("pending"); // untouched
+  });
+
+  it("✓ service_role: the order's own creator can have it cancelled on their behalf", async () => {
+    const orderId = await createPendingOrder(creatorEmail);
+    const { error } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: creatorId,
+      p_reason: "Changed my mind",
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, payment_status, cancel_reason, fulfilment_log")
+      .eq("id", orderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("cancelled");
+    expect(order?.payment_status).toBe("cancelled");
+    expect(order?.cancel_reason).toBe("Changed my mind");
+    const log = (order?.fulfilment_log ?? []) as { action: string; detail?: Record<string, unknown> }[];
+    const entry = log.find((item) => item.action === "cancelled");
+    expect(entry?.detail?.cancelled_by).toBe("customer");
+
+    const { data: auditRows } = await adminClient
+      .from("audit_log")
+      .select("action, actor_id")
+      .eq("target_id", orderId)
+      .eq("action", "order.cancel_pending");
+    expect(auditRows?.length).toBe(1);
+    expect(auditRows?.[0]?.actor_id).toBe(creatorId);
+  });
+
+  it("✓ service_role: a company_admin can have a colleague's pending order cancelled", async () => {
+    const orderId = await createPendingOrder(colleagueEmail);
+    const { error } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: adminId,
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("payment_status")
+      .eq("id", orderId)
+      .single();
+    expect(order?.payment_status).toBe("cancelled");
+  });
+
+  it("✗ service_role: a plain colleague (not the creator, not an admin) is rejected", async () => {
+    const orderId = await createPendingOrder(creatorEmail);
+    const { error } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: colleagueId,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("payment_status")
+      .eq("id", orderId)
+      .single();
+    expect(order?.payment_status).toBe("pending"); // untouched
+  });
+
+  it("✗ service_role: isolation — an admin in company B cannot cancel company A's order", async () => {
+    const orderId = await createPendingOrder(creatorEmail);
+    const { error } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: bAdminId,
+    });
+    expect(error).not.toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("payment_status")
+      .eq("id", orderId)
+      .single();
+    expect(order?.payment_status).toBe("pending"); // untouched
+  });
+
+  it("✗ service_role: refuses an order that has already been paid", async () => {
+    const orderId = await createPendingOrder(creatorEmail);
+    // Direct admin update, not mark_order_paid — this test only needs the
+    // "already paid" precondition in place, not a real payment-gate exercise.
+    await adminClient.from("orders").update({ payment_status: "paid" }).eq("id", orderId);
+
+    const { error } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: creatorId,
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ service_role: refuses an order that's already cancelled (no double-cancel)", async () => {
+    const orderId = await createPendingOrder(creatorEmail);
+    const { error: firstError } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: creatorId,
+    });
+    expect(firstError).toBeNull();
+
+    const { error: secondError } = await adminClient.rpc("cancel_pending_order", {
+      p_order_id: orderId,
+      p_actor_id: creatorId,
+    });
+    expect(secondError).not.toBeNull();
+  });
+});
