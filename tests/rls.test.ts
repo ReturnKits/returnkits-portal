@@ -4321,3 +4321,344 @@ describe("Prepaid credits — credit_ledger RLS, redemption, purchase, and resto
     });
   });
 });
+
+describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanced Cover redemption (20260819)", () => {
+  // Scope confirmed with the user: Laptop only, tier decided per-purchase
+  // (not cumulative lifetime volume), toggled self-serve by company_admin
+  // from Settings. Every tier bundles the £2,000 Enhanced Cover tier into
+  // the credit's price already, so create_order/create_internal_order
+  // auto-attach that cover (at zero extra charge) whenever a company with
+  // the switch on redeems a Laptop credit. See
+  // 20260819100000_enterprise_pricing.sql /
+  // 20260819110000_enterprise_pricing_order_rpcs.sql and CLAUDE.md's locked
+  // decision for the full reasoning, including the accepted v1
+  // simplification (fungible credit balance means the flag is checked at
+  // REDEMPTION time, not purchase time).
+  //
+  // Deliberately its own describe block with fresh fixtures rather than
+  // extending the "Prepaid credits" block above -- flipping
+  // enterprise_pricing_enabled on a shared companyA would risk leaking into
+  // that block's other assertions about flat-rate pricing.
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const adminEmail = uniqueEmail("ent-admin");
+  const memberEmail = uniqueEmail("ent-member");
+  const bEmail = uniqueEmail("ent-b1");
+  const staffEmail = uniqueEmail("ent-staff");
+  let staffId: string;
+  let employeeA: { id: string };
+
+  beforeAll(async () => {
+    companyA = await createCompany("Enterprise Pricing Test Co A");
+    companyB = await createCompany("Enterprise Pricing Test Co B");
+
+    const admin = await createAuthUser(adminEmail);
+    const member = await createAuthUser(memberEmail);
+    const b1 = await createAuthUser(bEmail);
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+
+    await createProfile(admin.id, companyA.id, adminEmail, "company_admin");
+    await createProfile(member.id, companyA.id, memberEmail, "company_member");
+    await createProfile(b1.id, companyB.id, bEmail, "company_admin");
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Enterprise Test Employee", email: "ent-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().in("company_id", [companyA.id, companyB.id]);
+    await adminClient.from("credit_ledger").delete().in("company_id", [companyA.id, companyB.id]);
+    for (const email of [adminEmail, memberEmail, bEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  async function balanceFor(companyId: string, kitTypeId: string): Promise<number> {
+    const { data, error } = await adminClient
+      .from("credit_ledger")
+      .select("direction, quantity")
+      .eq("company_id", companyId)
+      .eq("kit_type_id", kitTypeId);
+    if (error) throw error;
+    return (data ?? []).reduce((sum, row) => sum + (row.direction === "credit" ? row.quantity : -row.quantity), 0);
+  }
+
+  describe("Schema: enterprise_pricing_tiers", () => {
+    it("✓ seeded with the four Laptop breakpoints, all bundling the £2,000 cover tier", async () => {
+      const { data, error } = await adminClient
+        .from("enterprise_pricing_tiers")
+        .select("min_quantity, price_ex_vat_pence, includes_cover_tier_id, active")
+        .eq("kit_type_id", "laptop")
+        .order("min_quantity", { ascending: true });
+      expect(error).toBeNull();
+      expect(data).toEqual([
+        { min_quantity: 1, price_ex_vat_pence: 8500, includes_cover_tier_id: "up_to_2000", active: true },
+        { min_quantity: 10, price_ex_vat_pence: 8000, includes_cover_tier_id: "up_to_2000", active: true },
+        { min_quantity: 25, price_ex_vat_pence: 7700, includes_cover_tier_id: "up_to_2000", active: true },
+        { min_quantity: 50, price_ex_vat_pence: 7400, includes_cover_tier_id: "up_to_2000", active: true },
+      ]);
+    });
+
+    it("✓ world-readable: a signed-in company user can read the tier table", async () => {
+      const client = await clientAsUser(memberEmail);
+      const { data, error } = await client.from("enterprise_pricing_tiers").select("id").eq("kit_type_id", "laptop");
+      expect(error).toBeNull();
+      expect(data?.length).toBe(4);
+    });
+
+    it("✗ authenticated clients cannot write enterprise_pricing_tiers (same world-readable-but-read-only shape as kit_types/cover_tiers)", async () => {
+      const client = await clientAsUser(adminEmail);
+      const { error, count } = await client
+        .from("enterprise_pricing_tiers")
+        .update({ price_ex_vat_pence: 1 }, { count: "exact" })
+        .eq("kit_type_id", "laptop")
+        .eq("min_quantity", 1)
+        .select("id");
+      expect(error).toBeNull();
+      expect(count).toBe(0);
+
+      const { data: unchanged } = await adminClient
+        .from("enterprise_pricing_tiers")
+        .select("price_ex_vat_pence")
+        .eq("kit_type_id", "laptop")
+        .eq("min_quantity", 1)
+        .single();
+      expect(unchanged?.price_ex_vat_pence).toBe(8500);
+    });
+
+    it("✓ per-purchase tier lookup (highest qualifying min_quantity wins) matches every documented breakpoint", async () => {
+      async function tierPriceFor(quantity: number): Promise<number | null> {
+        const { data, error } = await adminClient
+          .from("enterprise_pricing_tiers")
+          .select("price_ex_vat_pence")
+          .eq("kit_type_id", "laptop")
+          .eq("active", true)
+          .lte("min_quantity", quantity)
+          .order("min_quantity", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (error) throw error;
+        return data?.price_ex_vat_pence ?? null;
+      }
+
+      expect(await tierPriceFor(9)).toBe(8500);
+      expect(await tierPriceFor(10)).toBe(8000);
+      expect(await tierPriceFor(24)).toBe(8000);
+      expect(await tierPriceFor(25)).toBe(7700);
+      expect(await tierPriceFor(49)).toBe(7700);
+      expect(await tierPriceFor(50)).toBe(7400);
+      expect(await tierPriceFor(200)).toBe(7400);
+    });
+  });
+
+  describe("RLS: companies.enterprise_pricing_enabled — self-serve, admin-only toggle", () => {
+    it("✓ defaults to false for a newly created company", async () => {
+      const { data } = await adminClient
+        .from("companies")
+        .select("enterprise_pricing_enabled")
+        .eq("id", companyA.id)
+        .single();
+      expect(data?.enterprise_pricing_enabled).toBe(false);
+    });
+
+    it("✓ company_admin can turn Enterprise pricing on for their own company", async () => {
+      const client = await clientAsUser(adminEmail);
+      const { error } = await client
+        .from("companies")
+        .update({ enterprise_pricing_enabled: true })
+        .eq("id", companyA.id);
+      expect(error).toBeNull();
+      const { data } = await adminClient
+        .from("companies")
+        .select("enterprise_pricing_enabled")
+        .eq("id", companyA.id)
+        .single();
+      expect(data?.enterprise_pricing_enabled).toBe(true);
+    });
+
+    it("✗ a company_member (not admin) cannot toggle Enterprise pricing", async () => {
+      const client = await clientAsUser(memberEmail);
+      const { error, count } = await client
+        .from("companies")
+        .update({ enterprise_pricing_enabled: false }, { count: "exact" })
+        .eq("id", companyA.id)
+        .select("id");
+      expect(error).toBeNull();
+      expect(count).toBe(0);
+      // Untouched by the rejected attempt -- still true from the test above.
+      const { data } = await adminClient
+        .from("companies")
+        .select("enterprise_pricing_enabled")
+        .eq("id", companyA.id)
+        .single();
+      expect(data?.enterprise_pricing_enabled).toBe(true);
+    });
+  });
+
+  describe("create_order() redemption: bundled cover auto-attach", () => {
+    it("✓ baseline regression: with Enterprise pricing OFF, redeeming a Laptop credit attaches no cover", async () => {
+      await adminClient.from("companies").update({ enterprise_pricing_enabled: false }).eq("id", companyB.id);
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyB.id,
+        kit_type_id: "laptop",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: 1,
+        reason: "seed for baseline (no enterprise) redemption test",
+      });
+
+      const { data: emp } = await adminClient
+        .from("employees")
+        .insert({ company_id: companyB.id, full_name: "Co B Employee", email: "co-b-emp@example.com" })
+        .select()
+        .single();
+
+      const client = await clientAsUser(bEmail);
+      const { data: orderId, error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: (emp as { id: string }).id,
+        p_pay_with_credit: true,
+      });
+      expect(error).toBeNull();
+
+      const { data: order } = await adminClient
+        .from("orders")
+        .select("cover_tier_id, cover_price_ex_vat_pence, payment_status")
+        .eq("id", orderId as string)
+        .single();
+      expect(order?.cover_tier_id).toBeNull();
+      expect(order?.cover_price_ex_vat_pence).toBeNull();
+      expect(order?.payment_status).toBe("paid");
+    });
+
+    it("✓ with Enterprise pricing ON, redeeming a Laptop credit auto-attaches the £2,000 cover tier at zero extra charge", async () => {
+      // companyA was switched on in the RLS block above.
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "laptop",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: (await balanceFor(companyA.id, "laptop")) + 1,
+        reason: "seed for enterprise redemption test",
+      });
+
+      const client = await clientAsUser(adminEmail);
+      const { data: orderId, error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_pay_with_credit: true,
+      });
+      expect(error).toBeNull();
+
+      const { data: order } = await adminClient
+        .from("orders")
+        .select("cover_tier_id, cover_price_ex_vat_pence, payment_status, paid_with_credit")
+        .eq("id", orderId as string)
+        .single();
+      expect(order?.cover_tier_id).toBe("up_to_2000");
+      expect(order?.cover_price_ex_vat_pence).toBe(0); // bundled, never a separate charge
+      expect(order?.payment_status).toBe("paid");
+      expect(order?.paid_with_credit).toBe(true);
+    });
+
+    it("✗ even for an Enterprise company, explicitly passing p_cover_tier_id alongside p_pay_with_credit is still rejected", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "laptop",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: (await balanceFor(companyA.id, "laptop")) + 1,
+        reason: "seed for explicit-cover-still-rejected test",
+      });
+      const balanceBefore = await balanceFor(companyA.id, "laptop");
+
+      const client = await clientAsUser(adminEmail);
+      const { error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_cover_tier_id: "up_to_500",
+        p_pay_with_credit: true,
+      });
+      expect(error).not.toBeNull();
+
+      const balanceAfter = await balanceFor(companyA.id, "laptop");
+      expect(balanceAfter).toBe(balanceBefore); // rejected call must not have debited anything
+    });
+
+    it("✓ Enterprise pricing is scoped to Laptop only — redeeming a Phone credit gets no auto-attached cover even with the switch on", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "phone",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: (await balanceFor(companyA.id, "phone")) + 1,
+        reason: "seed for laptop-only-scope test",
+      });
+
+      const client = await clientAsUser(adminEmail);
+      const { data: orderId, error } = await client.rpc("create_order", {
+        p_kit_type_id: "phone",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_pay_with_credit: true,
+      });
+      expect(error).toBeNull();
+
+      const { data: order } = await adminClient
+        .from("orders")
+        .select("cover_tier_id, cover_price_ex_vat_pence")
+        .eq("id", orderId as string)
+        .single();
+      expect(order?.cover_tier_id).toBeNull();
+      expect(order?.cover_price_ex_vat_pence).toBeNull();
+    });
+  });
+
+  describe("create_internal_order() redemption: same auto-attach rule, Retool path", () => {
+    it("✓ staff creating a credit-paid Laptop order for an Enterprise company also gets the bundled cover attached", async () => {
+      await adminClient.from("credit_ledger").insert({
+        company_id: companyA.id,
+        kit_type_id: "laptop",
+        transaction_type: "purchase",
+        direction: "credit",
+        quantity: 1,
+        balance_after: (await balanceFor(companyA.id, "laptop")) + 1,
+        reason: "seed for create_internal_order enterprise test",
+      });
+
+      const { data: orderId, error } = await adminClient.rpc("create_internal_order", {
+        p_company_id: companyA.id,
+        p_actor_id: staffId,
+        p_kit_type_id: "laptop",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+        p_pay_with_credit: true,
+      });
+      expect(error).toBeNull();
+
+      const { data: order } = await adminClient
+        .from("orders")
+        .select("cover_tier_id, cover_price_ex_vat_pence, source")
+        .eq("id", orderId as string)
+        .single();
+      expect(order?.cover_tier_id).toBe("up_to_2000");
+      expect(order?.cover_price_ex_vat_pence).toBe(0);
+      expect(order?.source).toBe("internal_staff");
+    });
+  });
+});
