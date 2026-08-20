@@ -3311,6 +3311,140 @@ describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown
   });
 });
 
+// Restructured 20260820 (migration 20260820220000) off a direct user
+// question ("how would you restructure the email reminders?"). Two gaps in
+// the previous single-shape rule, both exercised below:
+//   1. leaver_last_day (captured at order creation, previously unused here)
+//      now blocks a drop-off return order's nudge until it has passed —
+//      the leaver may still need the device past the dispatch-SLA window.
+//   2. A courier-collection return order is now gated purely on
+//      collection_date having passed (with a one-day buffer, strict <),
+//      completely independent of the 5-working-day dispatch SLA — proven
+//      below by dispatching the collection order mere seconds before the
+//      check, which would never clear the drop-off SLA on its own.
+describe("orders_needing_checkin() — leaver_last_day gate + collection_date eligibility (restructure, 20260820)", () => {
+  let company: { id: string };
+  let dropOffOrder: { id: string };
+  let collectionOrder: { id: string };
+  const email = uniqueEmail("checkin-restructure");
+
+  function eligible(data: unknown, orderId: string): string | undefined {
+    return (data as { order_id: string; checkin_type: string }[]).find((r) => r.order_id === orderId)?.checkin_type;
+  }
+
+  beforeAll(async () => {
+    company = await createCompany("Checkin Restructure Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+
+    const { data: employee, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Restructure Test Employee", email: "checkin-restructure-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Restructure Street", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(email);
+
+    // Drop-off order, dispatched well past the 5-working-day SLA — the SLA
+    // half of the rule is already satisfied; only leaver_last_day varies
+    // across the assertions below.
+    const { data: dropOffId, error: dropOffError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee!.id,
+      p_return_address_id: (addr as { id: string }).id,
+      p_return_method: "drop_off",
+    });
+    if (dropOffError) throw dropOffError;
+    dropOffOrder = { id: dropOffId as string };
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "dispatched",
+        fulfilment_log: [{ at: "2026-08-01T09:00:00+00:00", action: "dispatched", detail: {}, actor_id: user.id }],
+      })
+      .eq("id", dropOffOrder.id);
+
+    // Collection order, dispatched moments ago (deliberately nowhere near
+    // clearing the 5-working-day SLA) — proves collection eligibility is
+    // driven entirely by collection_date, not dispatch date.
+    const { data: collectionId, error: collectionError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee!.id,
+      p_return_address_id: (addr as { id: string }).id,
+      p_return_method: "collection",
+      p_collection_date: "2026-08-21",
+    });
+    if (collectionError) throw collectionError;
+    collectionOrder = { id: collectionId as string };
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "dispatched",
+        fulfilment_log: [{ at: new Date().toISOString(), action: "dispatched", detail: {}, actor_id: user.id }],
+      })
+      .eq("id", collectionOrder.id);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("id", dropOffOrder.id);
+    await adminClient.from("orders").delete().eq("id", collectionOrder.id);
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ a drop-off return order past its SLA is NOT yet due a nudge while leaver_last_day is still in the future", async () => {
+    await adminClient.from("orders").update({ leaver_last_day: "2099-01-01" }).eq("id", dropOffOrder.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, dropOffOrder.id)).toBeUndefined();
+  });
+
+  it("✓ the same drop-off order becomes due once leaver_last_day has passed", async () => {
+    await adminClient.from("orders").update({ leaver_last_day: "2026-08-01" }).eq("id", dropOffOrder.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, dropOffOrder.id)).toBe("checkin_sent");
+  });
+
+  it("✓ a drop-off order with no leaver_last_day set at all is unaffected by the new gate (existing SLA-only behaviour preserved)", async () => {
+    await adminClient.from("orders").update({ leaver_last_day: null }).eq("id", dropOffOrder.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, dropOffOrder.id)).toBe("checkin_sent");
+  });
+
+  it("✗ a collection order is NOT due while collection_date is still tomorrow", async () => {
+    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    await adminClient.from("orders").update({ collection_date: tomorrow }).eq("id", collectionOrder.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, collectionOrder.id)).toBeUndefined();
+  });
+
+  it("✗ a collection order is NOT due when collection_date is today (one-day buffer, strict <)", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    await adminClient.from("orders").update({ collection_date: today }).eq("id", collectionOrder.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, collectionOrder.id)).toBeUndefined();
+  });
+
+  it("✓ a collection order becomes due once collection_date was yesterday — independent of the dispatch-date SLA", async () => {
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    await adminClient.from("orders").update({ collection_date: yesterday }).eq("id", collectionOrder.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    // Dispatched only moments ago in beforeAll — nowhere near the
+    // 5-working-day SLA a drop-off order would need. Eligibility here can
+    // only be explained by the collection_date branch, not the SLA branch.
+    expect(eligible(data, collectionOrder.id)).toBe("checkin_sent");
+  });
+});
+
 // The blocks below close gaps found in a Launch Gate review: real,
 // tenant-scoped RLS policies existed for these tables from Phase 2/3
 // onward, but no test ever exercised either direction on them -- they were

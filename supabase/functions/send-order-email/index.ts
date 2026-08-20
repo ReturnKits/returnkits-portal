@@ -138,6 +138,15 @@ const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const resendApiKey = Deno.env.get("RESEND_API_KEY");
 const FROM_ADDRESS = "ReturnKits <noreply@mail.returnkits.com>";
 
+// Portal's own custom domain (added for the check-in reminder restructure
+// below). No request "origin" header is available in this context --
+// send-checkin-notifications is cron-triggered, not a browser call -- so
+// this is a plain hardcoded constant, same category as FROM_ADDRESS above.
+// Used only to link the orderer straight to the employee directory from
+// the no_email reminder branch, so the gap is one click to fix instead of
+// a message that just repeats every few days.
+const PORTAL_URL = "https://portal.returnkits.com";
+
 if (!supabaseUrl || !serviceRoleKey || !resendApiKey) {
   console.error("send-order-email: missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / RESEND_API_KEY");
 }
@@ -603,33 +612,98 @@ function buildDispatchedEmail(props: {
 // would have had if shown unconditionally.
 type CheckinSentEmployeeStatus = "notified" | "notify_off" | "no_email";
 
+// "Kit" on its own is ambiguous once a company has more than one return in
+// flight -- device_reference (asset tag / serial, optional at order
+// creation) disambiguates when it's present, without changing anything for
+// the majority of orders that don't set it.
+function deviceLabel(kitLabel: string, deviceReference: string | null): string {
+  return deviceReference ? `${kitLabel} (${escapeHtml(deviceReference)})` : escapeHtml(kitLabel);
+}
+
+// Restructured 20260820 off a direct question from the user ("if you were
+// to restructure the email reminders, how would you structure them?").
+// Two real gaps in the previous single-shape reminder:
+//
+// 1. It used the same "please post it back" copy regardless of
+//    return_method -- but a courier-collection order has nothing for
+//    anyone to post; the eligibility gate below (orders_needing_checkin())
+//    now only fires this for a collection order once its collection_date
+//    has passed without the leg moving to in_transit/completed, so the
+//    honest framing here is "this looks like a missed collection," not a
+//    generic nag.
+// 2. The no_email branch just repeated "we don't have an email on file"
+//    forever with nothing actionable in the email itself. It now links
+//    straight to the employee directory so the orderer can fix the actual
+//    gap in one click, rather than being told about it on a loop.
 function buildCheckinSentEmail(props: {
   companyName: string;
   reference: string;
   kitLabel: string;
+  deviceReference: string | null;
   employeeName: string | null;
   employeeStatus: CheckinSentEmployeeStatus;
+  returnMethod: "drop_off" | "collection";
+  collectionDate: string | null;
 }): string {
   const employeeDisplay = escapeHtml(props.employeeName ?? "the recipient");
-  const baseLine = `We haven't seen ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} come back to us yet.`;
+  const itemLabel = deviceLabel(props.kitLabel, props.deviceReference);
+  const employeeDirectoryLink = `<a href="${PORTAL_URL}/employees" style="color:#2563eb;text-decoration:none;">employee directory</a>`;
+  const isCollectionOverdue = props.returnMethod === "collection";
 
-  let followUp: string;
-  if (props.employeeStatus === "notified") {
-    followUp = `We've also sent ${employeeDisplay} a reminder.`;
-  } else if (props.employeeStatus === "notify_off") {
-    followUp = `You may want to follow up with ${employeeDisplay} directly — employee notifications weren't turned on for this order.`;
+  let heading: string;
+  let bodyHtml: string;
+
+  if (isCollectionOverdue) {
+    heading = "Collection may have been missed";
+    const dateLine = props.collectionDate ? ` around ${escapeHtml(formatDate(props.collectionDate))}` : "";
+
+    let followUp: string;
+    if (props.employeeStatus === "notified") {
+      followUp = `We've let ${employeeDisplay} know too — nothing they need to do differently, we're chasing this up with the courier.`;
+    } else if (props.employeeStatus === "notify_off") {
+      followUp = `Employee notifications weren't turned on for this order, so ${employeeDisplay} hasn't heard from us about this — you may want to give them a heads-up.`;
+    } else {
+      followUp = `We don't have an email on file for ${employeeDisplay}, so they haven't heard from us about this — you may want to give them a heads-up. Add their email from the ${employeeDirectoryLink} and future updates will reach them directly.`;
+    }
+
+    bodyHtml = `
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        ${itemLabel} for ${escapeHtml(props.companyName)} was due to be collected${dateLine}, but we haven't had it confirmed as picked up yet.
+      </p>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        ${followUp}
+      </p>
+      <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0;">We're following this up on our end — no action needed from you unless you'd like to check in yourself.</p>
+    `;
   } else {
-    followUp = `You may want to follow up with ${employeeDisplay} directly — we don't have an email on file for them.`;
+    heading = "Just a reminder";
+    const baseLine = `We haven't seen ${itemLabel} for ${escapeHtml(props.companyName)} come back to us yet.`;
+
+    let followUp: string;
+    if (props.employeeStatus === "notified") {
+      followUp = `We've also sent ${employeeDisplay} a reminder.`;
+    } else if (props.employeeStatus === "notify_off") {
+      followUp = `You may want to follow up with ${employeeDisplay} directly — employee notifications weren't turned on for this order.`;
+    } else {
+      followUp = `You may want to follow up with ${employeeDisplay} directly — we don't have an email on file for them. Add one from the ${employeeDirectoryLink} and future reminders will reach them directly.`;
+    }
+
+    bodyHtml = `
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        ${baseLine} ${followUp} We'll take it from there once it arrives — no need to let us know.
+      </p>
+    `;
   }
 
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
-    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
-    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-      ${baseLine} ${followUp} We'll take it from there once it arrives — no need to let us know.
-    </p>
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">${heading}</h1>
+    ${bodyHtml}
   `;
-  return layout(`Reminder: please send your kit back — ${props.reference}`, body);
+  const previewText = isCollectionOverdue
+    ? `Collection check — ${props.reference}`
+    : `Reminder: please send your kit back — ${props.reference}`;
+  return layout(previewText, body);
 }
 
 // ---- Check-in: has it arrived? (ship-to-new-employee orders) ------------
@@ -757,15 +831,46 @@ function buildEmployeeDispatchedEmail(props: {
   return layout("A ReturnKits box is on its way to you", body);
 }
 
-function buildEmployeeCheckinSentEmail(props: { employeeName: string }): string {
-  const body = `
-    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
-    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-      Hi ${escapeHtml(props.employeeName)}, when you get a chance, please pop your old device in the post
-      using the prepaid label included in the box we sent you. No need to let anyone know once it's done.
-    </p>
-  `;
-  return layout("Just a reminder — please post your device back", body);
+// Branches on return_method (added 20260820, same restructure as the
+// customer copy above): a "please post it back" instruction is simply
+// wrong for a collection order -- the employee didn't post anything and
+// isn't the one who can rebook a missed courier, so the collection variant
+// is deliberately reassuring rather than instructional. No device_reference
+// here, unlike the customer copy -- an employee only ever has one open
+// return of their own, so there's nothing to disambiguate.
+function buildEmployeeCheckinSentEmail(props: {
+  employeeName: string;
+  returnMethod: "drop_off" | "collection";
+  collectionDate: string | null;
+}): string {
+  const isCollectionOverdue = props.returnMethod === "collection";
+
+  let previewText: string;
+  let body: string;
+
+  if (isCollectionOverdue) {
+    previewText = "We're following up on your collection";
+    const dateLine = props.collectionDate ? ` around ${escapeHtml(formatDate(props.collectionDate))}` : "";
+    body = `
+      <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">We're following up on your collection</h1>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        Hi ${escapeHtml(props.employeeName)}, a courier was due to collect your old device${dateLine}, but it doesn't look like that's happened yet.
+      </p>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0;">
+        Nothing for you to do differently — just keep it packed and ready to hand over. We're chasing this up and will let you know if anything changes.
+      </p>
+    `;
+  } else {
+    previewText = "Just a reminder — please post your device back";
+    body = `
+      <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        Hi ${escapeHtml(props.employeeName)}, when you get a chance, please pop your old device in the post
+        using the prepaid label included in the box we sent you. No need to let anyone know once it's done.
+      </p>
+    `;
+  }
+  return layout(previewText, body);
 }
 
 // Fires alongside the customer-facing send for 'dispatched'/'checkin_sent'
@@ -799,7 +904,9 @@ async function sendEmployeeCopy(props: {
   const subject =
     props.type === "dispatched"
       ? "A ReturnKits box is on its way to you"
-      : "Just a reminder — please post your device back";
+      : props.returnMethod === "collection"
+        ? "We're following up on your collection"
+        : "Just a reminder — please post your device back";
 
   // One-shot for dispatched, scoped to this order specifically (not
   // bundle-aware like the customer confirmation -- an employee only cares
@@ -850,7 +957,11 @@ async function sendEmployeeCopy(props: {
           returnMethod: props.returnMethod,
           collectionDate: props.collectionDate,
         })
-      : buildEmployeeCheckinSentEmail({ employeeName: props.employeeName });
+      : buildEmployeeCheckinSentEmail({
+          employeeName: props.employeeName,
+          returnMethod: props.returnMethod,
+          collectionDate: props.collectionDate,
+        });
 
   try {
     const resendResp = await fetch("https://api.resend.com/emails", {
@@ -944,7 +1055,7 @@ async function handleRequest(req: Request): Promise<Response> {
        outbound_courier, outbound_tracking_number, outbound_tracking_url,
        return_courier, return_tracking_number, return_tracking_url, employee_id, notify_employee,
        employee_name, employee_email, employee_address_line1, employee_address_line2, employee_city, employee_postcode, employee_country,
-       return_method, collection_date,
+       return_method, collection_date, device_reference,
        company:companies(id, name), kit_types(label),
        employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
     )
@@ -981,6 +1092,7 @@ async function handleRequest(req: Request): Promise<Response> {
     employee_country: string | null;
     return_method: "drop_off" | "collection";
     collection_date: string | null;
+    device_reference: string | null;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
     employees: { full_name: string; email: string | null; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
@@ -1148,7 +1260,16 @@ async function handleRequest(req: Request): Promise<Response> {
       collectionDate: o.collection_date,
     });
   } else if (type === "checkin_sent") {
-    subject = `Reminder: please send your kit back — ${o.reference}`;
+    // orders_needing_checkin() (20260820 restructure) now only surfaces a
+    // collection-method return here once its collection_date has passed
+    // without the leg moving to in_transit/completed -- so by the time
+    // this branch runs, o.return_method === "collection" always means
+    // "this looks like a missed collection," never "collection is still
+    // pending." The subject and template both reflect that directly.
+    subject =
+      o.return_method === "collection"
+        ? `Collection check — ${o.reference}`
+        : `Reminder: please send your kit back — ${o.reference}`;
     // Mirrors sendEmployeeCopy()'s own eligibility check (notify_employee +
     // employee has an email) but doesn't wait for that send to actually
     // happen -- this only needs to know whether the system is configured to
@@ -1164,8 +1285,11 @@ async function handleRequest(req: Request): Promise<Response> {
       companyName: o.company.name,
       reference: o.reference,
       kitLabel: o.kit_types?.label ?? "Kit",
+      deviceReference: o.device_reference,
       employeeName: resolvedEmployee.name,
       employeeStatus,
+      returnMethod: o.return_method,
+      collectionDate: o.collection_date,
     });
   } else if (type === "checkin_received") {
     subject = `Has your kit arrived? — ${o.reference}`;
