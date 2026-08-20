@@ -3524,7 +3524,6 @@ describe("Security: internal-only SECURITY DEFINER functions never leak EXECUTE 
   const internalOnlyFunctions = [
     "record_stripe_payment",
     "record_credit_purchase",
-    "record_card_setup",
     "get_sendcloud_webhook_secret",
     "get_resend_webhook_secret",
     "apply_sendcloud_tracking_event",
@@ -4234,38 +4233,12 @@ describe("Prepaid credits — credit_ledger RLS, redemption, purchase, and resto
     });
   });
 
-  describe("record_card_setup() — webhook-only", () => {
-    it("✗ an authenticated client cannot call record_card_setup directly", async () => {
-      const client = await clientAsUser(a1Email);
-      const { error } = await client.rpc("record_card_setup", {
-        p_company_id: companyA.id,
-        p_stripe_payment_method_id: "pm_forged",
-      });
-      expect(error).not.toBeNull();
-    });
-
-    it("✓ service_role: caches the payment method id and logs to audit_log", async () => {
-      const { error } = await adminClient.rpc("record_card_setup", {
-        p_company_id: companyA.id,
-        p_stripe_payment_method_id: "pm_test_saved_card",
-      });
-      expect(error).toBeNull();
-
-      const { data: company } = await adminClient
-        .from("companies")
-        .select("stripe_payment_method_id")
-        .eq("id", companyA.id)
-        .single();
-      expect(company?.stripe_payment_method_id).toBe("pm_test_saved_card");
-
-      const { data: auditRows } = await adminClient
-        .from("audit_log")
-        .select("action, target_id")
-        .eq("target_id", companyA.id)
-        .eq("action", "company.card_setup");
-      expect(auditRows?.length).toBeGreaterThan(0);
-    });
-  });
+  // record_card_setup() and companies.stripe_payment_method_id were removed
+  // 20260820 (migration 20260820100000_remove_saved_card_feature.sql) — see
+  // CLAUDE.md "Saved card feature removed". The describe block that used to
+  // live here asserted record_card_setup was webhook-only and cached the
+  // PaymentMethod id; both the RPC and the column it wrote to are gone, so
+  // there is nothing left to test.
 
   describe("cancel_order() restores a redeemed credit", () => {
     it("✓ cancelling a credit-paid order (still awaiting dispatch) puts the credit back", async () => {

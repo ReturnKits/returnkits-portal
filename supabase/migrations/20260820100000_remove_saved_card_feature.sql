@@ -1,0 +1,55 @@
+-- supabase/migrations/20260820100000_remove_saved_card_feature.sql
+--
+-- Removes the bespoke "saved card" feature (record_card_setup RPC and
+-- companies.stripe_payment_method_id, plus the create-card-setup-session /
+-- stripe-webhook 'card_setup' plumbing around them), per direct user
+-- feedback 20260820: "it doesnt make sense to have the saved card option in
+-- the portal, as this saved card can be used in the stripe checkout, can we
+-- remove this?"
+--
+-- The user is right, and it's confirmed by this codebase's own code: every
+-- Checkout Session this app creates (create-checkout-session,
+-- create-credit-checkout-session, create-credit-order-cover-checkout-
+-- session) already passes `customer: stripeCustomerId`. Stripe Checkout's
+-- own hosted page automatically offers a "save this card" checkbox, and
+-- once a card is saved to a Customer -- by ANY Checkout Session, not just a
+-- dedicated mode:'setup' one -- Stripe automatically presents it as a
+-- one-click option on every future Checkout Session for that same
+-- customer. No application code is required for that behaviour. This
+-- project built a second, parallel path to the same outcome (a standalone
+-- mode:'setup' Checkout Session purely to save a card, then
+-- record_card_setup caching the resulting PaymentMethod id and explicitly
+-- setting it as the Stripe customer's default_payment_method) that
+-- duplicated something Stripe already does for free. Confirmed by reading
+-- create-credit-checkout-session's own Checkout Session creation code
+-- before removing anything: it never actually reads
+-- companies.stripe_payment_method_id -- the header comment there only
+-- describes Stripe's own automatic behaviour once a card has been saved to
+-- the Customer, which happens regardless of whether this bespoke flow ever
+-- ran.
+--
+-- Net effect for a customer: no capability is lost. They can still save a
+-- card and have it offered one-click next time, by ticking "save my
+-- payment details" on Stripe's own checkout page the first time they pay
+-- for anything (an order, a credit purchase, or Enhanced Cover paid
+-- separately) -- they just no longer need a dedicated "Save a card" button
+-- in the portal to do it.
+--
+-- Removed: record_card_setup() (webhook-only RPC), companies.
+-- stripe_payment_method_id (the cached PaymentMethod id it wrote, and the
+-- only thing the Lovable "Saved card" card on /credits read). Not removed:
+-- companies.stripe_customer_id -- that's the Stripe Customer object cache,
+-- unrelated to payment methods, still required by every Checkout-Session-
+-- creating Edge Function.
+--
+-- create-card-setup-session and stripe-webhook's 'card_setup' metadata.type
+-- branch are handled at the application layer, not here (there is no
+-- Supabase MCP tool to delete a deployed Edge Function outright --
+-- create-card-setup-session is redeployed as a 410 Gone stub rather than
+-- left pointing at a dropped RPC; stripe-webhook is redeployed with
+-- handleCardSetup and the 'card_setup' switch case removed). See
+-- CLAUDE.md's "Saved card feature removed" locked-decision entry.
+
+drop function if exists public.record_card_setup(uuid, text);
+
+alter table public.companies drop column if exists stripe_payment_method_id;
