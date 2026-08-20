@@ -5380,3 +5380,235 @@ describe("cancel_pending_order() — customer self-cancel before payment (202608
     expect(secondError).not.toBeNull();
   });
 });
+
+// 20260820: orders.return_method ('drop_off' | 'collection', default 'drop_off')
+// + orders.collection_date (nullable, required iff method='collection'), added
+// alongside the fix to the dispatched-email logic bug (the customer copy was
+// giving pack/post instructions to the orderer, not the employee who actually
+// has the device). Three CHECK constraints (orders_return_method_check,
+// orders_collection_date_consistent, orders_collection_only_for_return) plus
+// matching validation inside create_order()/create_internal_order() — this
+// block proves both layers, not just the RPC-level guard, per this project's
+// own "database constraints are the real gate, RPC checks are a nicer error
+// message" convention (see the CHECK-constraint isolation tests elsewhere in
+// this file, e.g. orders_credit_excludes_cover).
+describe("return_method / collection_date on return orders (added 20260820)", () => {
+  let companyA: { id: string };
+  const a1Email = uniqueEmail("retmethod-a1");
+  const staffEmail = uniqueEmail("retmethod-staff");
+  let employeeA: { id: string };
+  let addressA: { id: string };
+  let staffId: string;
+
+  beforeAll(async () => {
+    companyA = await createCompany("Return Method Test Co A");
+
+    const a1 = await createAuthUser(a1Email);
+    await createProfile(a1.id, companyA.id, a1Email, "company_admin");
+
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Return Method Employee", email: "retmethod-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: companyA.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+    addressA = addr as { id: string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", companyA.id);
+    await deleteAuthUserByEmail(a1Email);
+    await deleteAuthUserByEmail(staffEmail);
+    await adminClient.from("companies").delete().eq("id", companyA.id);
+  });
+
+  it("✓ create_order() defaults return_method to 'drop_off' with a null collection_date when not passed", async () => {
+    const client = await clientAsUser(a1Email);
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+    });
+    expect(error).toBeNull();
+
+    const { data } = await adminClient.from("orders").select("return_method, collection_date").eq("id", orderId as string).single();
+    expect(data?.return_method).toBe("drop_off");
+    expect(data?.collection_date).toBeNull();
+  });
+
+  it("✓ create_order() accepts p_return_method:'collection' with a p_collection_date on a return order", async () => {
+    const client = await clientAsUser(a1Email);
+    const collectionDate = "2026-08-25";
+    const { data: orderId, error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+      p_return_method: "collection",
+      p_collection_date: collectionDate,
+    });
+    expect(error).toBeNull();
+
+    const { data } = await adminClient.from("orders").select("return_method, collection_date").eq("id", orderId as string).single();
+    expect(data?.return_method).toBe("collection");
+    expect(data?.collection_date).toBe(collectionDate);
+  });
+
+  it("✗ create_order() rejects p_return_method:'collection' with no p_collection_date", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+      p_return_method: "collection",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ create_order() rejects a p_collection_date when p_return_method is left as 'drop_off'", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+      p_collection_date: "2026-08-25",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ create_order() rejects an invalid p_return_method value", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+      p_return_method: "courier_pigeon",
+      p_collection_date: "2026-08-25",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✗ create_order() rejects p_return_method:'collection' on a ship_to_new_employee order — collection is return-only", async () => {
+    const client = await clientAsUser(a1Email);
+    const { error } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+      p_return_method: "collection",
+      p_collection_date: "2026-08-25",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ create_internal_order() (Retool/staff path) accepts the same return_method + collection_date params", async () => {
+    const collectionDate = "2026-08-27";
+    const { data: orderId, error } = await adminClient.rpc("create_internal_order", {
+      p_company_id: companyA.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+      p_return_method: "collection",
+      p_collection_date: collectionDate,
+    });
+    expect(error).toBeNull();
+
+    const { data } = await adminClient.from("orders").select("return_method, collection_date").eq("id", orderId as string).single();
+    expect(data?.return_method).toBe("collection");
+    expect(data?.collection_date).toBe(collectionDate);
+  });
+
+  it("✗ create_internal_order() rejects the same invalid combination (collection with no date) as create_order()", async () => {
+    const { error } = await adminClient.rpc("create_internal_order", {
+      p_company_id: companyA.id,
+      p_actor_id: staffId,
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+      p_return_method: "collection",
+    });
+    expect(error).not.toBeNull();
+  });
+
+  // Direct-insert isolation tests: proves the three CHECK constraints hold
+  // even bypassing the RPCs entirely (service_role can insert straight into
+  // orders) — the RPC-level validation above is a nicer error message, the
+  // CHECK constraints are the real gate, same discipline as every other
+  // constraint-backed invariant in this file.
+  describe("CHECK constraints hold independently of the RPC layer", () => {
+    let baseOrderId: string;
+
+    beforeAll(async () => {
+      const client = await clientAsUser(a1Email);
+      const { data: orderId, error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "return",
+        p_employee_id: employeeA.id,
+        p_return_address_id: addressA.id,
+      });
+      if (error) throw error;
+      baseOrderId = orderId as string;
+    });
+
+    it("✗ orders_return_method_check rejects a direct update to an invalid method", async () => {
+      const { error } = await adminClient.from("orders").update({ return_method: "teleport" }).eq("id", baseOrderId);
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/orders_return_method_check/);
+    });
+
+    it("✗ orders_collection_date_consistent rejects 'collection' with a null date via direct update", async () => {
+      const { error } = await adminClient.from("orders").update({ return_method: "collection" }).eq("id", baseOrderId);
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/orders_collection_date_consistent/);
+    });
+
+    it("✗ orders_collection_date_consistent rejects a non-null collection_date while method stays 'drop_off'", async () => {
+      const { error } = await adminClient.from("orders").update({ collection_date: "2026-08-25" }).eq("id", baseOrderId);
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/orders_collection_date_consistent/);
+    });
+
+    it("✓ setting both method and date together in one statement satisfies the constraint", async () => {
+      const { error } = await adminClient
+        .from("orders")
+        .update({ return_method: "collection", collection_date: "2026-08-25" })
+        .eq("id", baseOrderId);
+      expect(error).toBeNull();
+    });
+
+    it("✗ orders_collection_only_for_return rejects 'collection' on a non-return order, direct update", async () => {
+      const client = await clientAsUser(a1Email);
+      const { data: shipId, error: shipError } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "ship_to_new_employee",
+        p_employee_id: employeeA.id,
+      });
+      if (shipError) throw shipError;
+
+      const { error } = await adminClient
+        .from("orders")
+        .update({ return_method: "collection", collection_date: "2026-08-25" })
+        .eq("id", shipId as string);
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/orders_collection_only_for_return/);
+    });
+  });
+});

@@ -468,6 +468,28 @@ function trackButton(url: string): string {
   </tr></table>`;
 }
 
+// Shared drop-off numbered steps + courier guidance link -- used by
+// buildEmployeeDispatchedEmail (the normal case: the employee is the one
+// who actually packs and posts the device, so they get the real
+// instructions) and, as a fallback, by buildDispatchedEmail's customer copy
+// when notify_employee is off and there's no other channel to deliver
+// these instructions through. Factored out 20260820 during the logic
+// review below rather than duplicated across both templates.
+function dropOffSteps(courier: string): string {
+  const guidanceUrl = courierGuidanceUrl(courier);
+  const isDpd = courier.toLowerCase().includes("dpd");
+  return `
+    ${numberedSteps([
+      "Pack the device securely using the materials enclosed in the kit",
+      "Attach the prepaid return label that's already inside the box — no need to print anything",
+      guidanceUrl
+        ? `Drop it off with ${escapeHtml(courier)}${isDpd ? " (use the link below to arrange a collection)" : " (use the link below to find a drop-off point)"}`
+        : `Drop it off with ${escapeHtml(courier)}`,
+    ])}
+    ${guidanceUrl ? `<p style="margin:0 0 20px;"><a href="${escapeHtml(guidanceUrl)}" style="color:#2563eb;font-size:13px;text-decoration:none;font-weight:600;">${isDpd ? "Arrange a DPD collection" : "Find a drop-off point"} →</a></p>` : ""}
+  `;
+}
+
 function buildDispatchedEmail(props: {
   companyName: string;
   reference: string;
@@ -477,6 +499,9 @@ function buildDispatchedEmail(props: {
   estimatedDeliveryDate: string | null;
   employeeName: string | null;
   employeeAddress: string | null;
+  notifyEmployee: boolean;
+  returnMethod: "drop_off" | "collection";
+  collectionDate: string | null;
 }): string {
   const isReturn = props.serviceType === "return";
 
@@ -489,31 +514,56 @@ function buildDispatchedEmail(props: {
   // DISPATCHED_ESTIMATED_DELIVERY_WORKING_DAYS above. Same "around ...
   // estimates can shift" caveat style as the return_in_transit email, for
   // the same reason: this is a working-day estimate, not a carrier-sourced
-  // promise. `props.courier` is still passed through and used below, in the
-  // return-order "sending it back" instructions only -- it's no longer
-  // displayed as its own field.
+  // promise.
   const etaLine = props.estimatedDeliveryDate
     ? `<p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">Estimated delivery: around ${escapeHtml(formatDate(props.estimatedDeliveryDate))}. Courier estimates can shift by a day or so.</p>`
     : "";
 
-  const guidanceUrl = courierGuidanceUrl(props.courier);
+  const employeeDisplay = escapeHtml(props.employeeName ?? "the recipient");
 
-  // The box that's just gone out already contains a prepaid label for the
-  // NEXT leg -- posting the old device back to us (return orders) or, for
-  // ship-to-new-employee orders, there's nothing further for the recipient
-  // to post. Only return orders get the "how to send it back" instructions.
-  const nextStepsBlock = isReturn
-    ? `<h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">Sending the device back</h2>
-       ${numberedSteps([
-         "Pack the device securely using the materials enclosed in the kit",
-         "Attach the prepaid return label that's already inside the box — no need to print anything",
-         guidanceUrl
-           ? `Drop it off with ${escapeHtml(props.courier)}${props.courier.toLowerCase().includes("dpd") ? " (use the link below to arrange a collection)" : " (use the link below to find a drop-off point)"}`
-           : `Drop it off with ${escapeHtml(props.courier)}`,
-       ])}
-       ${guidanceUrl ? `<p style="margin:0 0 20px;"><a href="${escapeHtml(guidanceUrl)}" style="color:#2563eb;font-size:13px;text-decoration:none;font-weight:600;">${props.courier.toLowerCase().includes("dpd") ? "Arrange a DPD collection" : "Find a drop-off point"} →</a></p>`
-         : ""}`
-    : `<p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">Nothing further to do on your end once it arrives with the new starter — we'll follow up to confirm.</p>`;
+  // Reframed 20260820 -- a code review the user asked for flagged a real
+  // logic bug here: this email goes to the ORDERER, not the person who
+  // physically has the box. For a return order that's the employee, who
+  // packs and hands over/posts the device -- the previous copy gave direct
+  // second-person packing instructions ("Pack the device...", "Drop it
+  // off...") to someone who usually can't act on them. Now this is purely
+  // informational whenever the employee has their own copy to act on (see
+  // buildEmployeeDispatchedEmail below, which now carries the real
+  // step-by-step + courier link), and only falls back to full instructions
+  // here when notify_employee is off -- since then this IS the only place
+  // they exist at all, and the orderer needs to relay them manually.
+  let nextStepsBlock: string;
+  if (!isReturn) {
+    nextStepsBlock = `<p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">Nothing further to do on your end once it arrives with the new starter — we'll follow up to confirm.</p>`;
+  } else {
+    const methodLine =
+      props.returnMethod === "collection" && props.collectionDate
+        ? `A courier will collect the old device from ${employeeDisplay} around ${escapeHtml(formatDate(props.collectionDate))}. Courier estimates can shift by a day or so.`
+        : `${employeeDisplay} has everything needed to pack and post the device back, including a prepaid return label.`;
+
+    if (props.notifyEmployee) {
+      nextStepsBlock = `
+        <h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">What happens next</h2>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 4px;">${methodLine}</p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:12px 0 0;">We've sent ${employeeDisplay} the full instructions directly — nothing further needed from you. We'll let you know once it's back with us.</p>
+      `;
+    } else {
+      nextStepsBlock = `
+        <h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">What happens next</h2>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">${methodLine}</p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0 0 12px;">Employee notifications aren't turned on for this order, so here's what to pass on to ${employeeDisplay}:</p>
+        ${
+          props.returnMethod === "collection"
+            ? numberedSteps([
+                "Pack the device securely using the materials enclosed in the kit",
+                "Attach the prepaid return label that's already inside the box — no need to print anything",
+                "Have it ready to hand to the courier on the collection date — no drop-off needed",
+              ])
+            : dropOffSteps(props.courier)
+        }
+      `;
+    }
+  }
 
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
@@ -661,17 +711,39 @@ function buildEmployeeDispatchedEmail(props: {
   serviceType: string;
   courier: string;
   trackingUrl: string | null;
+  returnMethod: "drop_off" | "collection";
+  collectionDate: string | null;
 }): string {
   const isReturn = props.serviceType === "return";
 
-  const whatNext = isReturn
-    ? `<p style="font-size:14px;line-height:22px;color:#374151;margin:16px 0 0;">
-         Once it arrives, please use it to post your old device back — everything you need, including a
-         prepaid return label, is already inside the box. No need to let anyone know once it's done.
-       </p>`
-    : `<p style="font-size:14px;line-height:22px;color:#374151;margin:16px 0 0;">
+  // Rewritten 20260820 (same review as buildDispatchedEmail above): this is
+  // the person who actually has the box, so this is where the real
+  // step-by-step + courier-specific guidance link belongs -- it used to
+  // only exist in the customer's copy, addressed to someone who couldn't
+  // act on it. Also now branches on return_method: when a collection has
+  // been arranged, there's nothing to drop off or look up, just a date to
+  // expect the courier.
+  let whatNext: string;
+  if (!isReturn) {
+    whatNext = `<p style="font-size:14px;line-height:22px;color:#374151;margin:16px 0 0;">
          Nothing else to do once it arrives — it's ready to use.
        </p>`;
+  } else if (props.returnMethod === "collection" && props.collectionDate) {
+    whatNext = `
+      <h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">Sending it back</h2>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        A courier (${escapeHtml(props.courier)}) will collect it from you around ${escapeHtml(formatDate(props.collectionDate))}. Courier estimates can shift by a day or so.
+      </p>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0;">
+        Just have the device packed with the prepaid return label attached — both already inside the box — and ready to hand over. No need to arrange anything yourself.
+      </p>
+    `;
+  } else {
+    whatNext = `
+      <h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">Sending it back</h2>
+      ${dropOffSteps(props.courier)}
+    `;
+  }
 
   const body = `
     <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">A ReturnKits box is on its way to you</h1>
@@ -711,6 +783,8 @@ async function sendEmployeeCopy(props: {
   courier: string | null;
   trackingUrl: string | null;
   notifyEmployee: boolean;
+  returnMethod: "drop_off" | "collection";
+  collectionDate: string | null;
 }): Promise<void> {
   if (props.type !== "dispatched" && props.type !== "checkin_sent") return;
   // Per-order opt-in (20260813, orders.notify_employee -- off by default).
@@ -773,6 +847,8 @@ async function sendEmployeeCopy(props: {
           serviceType: props.order.service_type,
           courier: props.courier ?? "Courier",
           trackingUrl: props.trackingUrl,
+          returnMethod: props.returnMethod,
+          collectionDate: props.collectionDate,
         })
       : buildEmployeeCheckinSentEmail({ employeeName: props.employeeName });
 
@@ -868,6 +944,7 @@ async function handleRequest(req: Request): Promise<Response> {
        outbound_courier, outbound_tracking_number, outbound_tracking_url,
        return_courier, return_tracking_number, return_tracking_url, employee_id, notify_employee,
        employee_name, employee_email, employee_address_line1, employee_address_line2, employee_city, employee_postcode, employee_country,
+       return_method, collection_date,
        company:companies(id, name), kit_types(label),
        employees(full_name, email, address_line1, address_line2, city, postcode, country)`,
     )
@@ -902,6 +979,8 @@ async function handleRequest(req: Request): Promise<Response> {
     employee_city: string | null;
     employee_postcode: string | null;
     employee_country: string | null;
+    return_method: "drop_off" | "collection";
+    collection_date: string | null;
     company: { id: string; name: string } | null;
     kit_types: { label: string } | null;
     employees: { full_name: string; email: string | null; address_line1: string | null; address_line2: string | null; city: string | null; postcode: string | null; country: string | null } | null;
@@ -1064,6 +1143,9 @@ async function handleRequest(req: Request): Promise<Response> {
       estimatedDeliveryDate,
       employeeName: resolvedEmployee.name,
       employeeAddress,
+      notifyEmployee: o.notify_employee,
+      returnMethod: o.return_method,
+      collectionDate: o.collection_date,
     });
   } else if (type === "checkin_sent") {
     subject = `Reminder: please send your kit back — ${o.reference}`;
@@ -1170,6 +1252,8 @@ async function handleRequest(req: Request): Promise<Response> {
     courier: o.outbound_courier,
     trackingUrl: o.outbound_tracking_url,
     notifyEmployee: o.notify_employee,
+    returnMethod: o.return_method,
+    collectionDate: o.collection_date,
   });
 
   if (!resendResp.ok) {
