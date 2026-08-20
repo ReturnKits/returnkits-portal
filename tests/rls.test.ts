@@ -2113,6 +2113,231 @@ describe("apply_sendcloud_poll_result() — 'Check Tracking Now' pull fallback (
   });
 });
 
+describe("Sendcloud carrier auto-detect — sendcloud_carrier_map + outbound_courier/return_courier backfill (20260820)", () => {
+  // Direct follow-on from a user question: "is there a way to auto detect
+  // the courier by the tracking number?" -- the real answer wasn't regex
+  // guessing a tracking number's format, it was noticing that Sendcloud
+  // already tells us the carrier on every poll/webhook via carrier_code,
+  // and this project was already receiving it (both functions take
+  // p_carrier_code) but only ever logging it into fulfilment_log's detail
+  // blob, never writing it back onto orders.outbound_courier/return_courier.
+  // See migration 20260820110000_sendcloud_carrier_auto_detect.sql.
+  let company: { id: string };
+  const custEmail = uniqueEmail("carrier-detect-cust");
+  const staffEmail = uniqueEmail("carrier-detect-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let shipOrderId: string;
+  let returnOrderId: string;
+  const shipTracking = `CARRIERSHIP-${Date.now()}`;
+  const returnTracking = `CARRIERRET-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Carrier Detect Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Carrier Detect Test", email: "carrier-detect@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(custEmail);
+
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (shipError) throw shipError;
+    shipOrderId = shipId as string;
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: (addr as { id: string }).id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    // Courier columns deliberately left null (create_order never sets
+    // them) -- both orders fast-forwarded straight to 'dispatched' with a
+    // tracking number, same shortcut every other Phase 6 describe block
+    // uses, so each test below starts from a clean, known "not yet
+    // detected" state.
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: shipTracking })
+      .eq("id", shipOrderId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", return_tracking_number: returnTracking })
+      .eq("id", returnOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ sendcloud_carrier_map is unreachable via a genuine anon-key client", async () => {
+    const { data, error } = await anonClient.from("sendcloud_carrier_map").select("*").limit(1);
+    expect(data).toBeNull();
+    expect(error).not.toBeNull();
+  });
+
+  it("✓ a resolvable carrier_code backfills a null outbound_courier on the poll path", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("outbound_courier, return_courier")
+      .eq("id", shipOrderId)
+      .single();
+    expect(order?.outbound_courier).toBe("Royal Mail");
+    expect(order?.return_courier).toBeNull(); // only the matched leg's column is touched
+  });
+
+  it("✓ a resolvable carrier_code backfills a null return_courier, matched by return_tracking_number", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: returnOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: returnTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("outbound_courier, return_courier")
+      .eq("id", returnOrderId)
+      .single();
+    expect(order?.return_courier).toBe("Royal Mail");
+    expect(order?.outbound_courier).toBeNull();
+  });
+
+  it("✓ an already-set courier is never overwritten by a later resolved carrier name", async () => {
+    // shipOrderId's outbound_courier is already "Royal Mail" from the first
+    // test above -- deliver it, feeding a DIFFERENT resolvable carrier_code,
+    // and confirm the original value survives untouched.
+    const { error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: shipOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: shipTracking,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient.from("orders").select("outbound_courier").eq("id", shipOrderId).single();
+    expect(order?.outbound_courier).toBe("Royal Mail"); // unchanged, not re-resolved
+  });
+
+  it("✓ an unmapped carrier_code leaves the courier column null -- no crash, no wrong guess", async () => {
+    // A fresh order in the same fixture shape, since shipOrderId/returnOrderId
+    // are already past 'dispatched' by this point in the suite.
+    const client = await clientAsUser(custEmail);
+    const { data: freshId, error: createError } = await client.rpc("create_order", {
+      p_kit_type_id: "monitor",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (createError) throw createError;
+    const freshTracking = `CARRIERFRESH-${Date.now()}`;
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: freshTracking })
+      .eq("id", freshId as string);
+
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: freshId,
+      p_actor_id: staffId,
+      p_tracking_number: freshTracking,
+      p_carrier_code: "some_totally_unrecognised_carrier",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "In transit",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true); // status transition is independent of carrier resolution
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("outbound_courier, fulfilment_status")
+      .eq("id", freshId as string)
+      .single();
+    expect(order?.fulfilment_status).toBe("in_transit");
+    expect(order?.outbound_courier).toBeNull();
+  });
+
+  it("✓ the webhook path (apply_sendcloud_tracking_event) backfills the courier the same way", async () => {
+    const client = await clientAsUser(custEmail);
+    const { data: webhookOrderId, error: createError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employee.id,
+    });
+    if (createError) throw createError;
+    const webhookTracking = `CARRIERWEBHOOK-${Date.now()}`;
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: webhookTracking })
+      .eq("id", webhookOrderId as string);
+
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookTracking,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "en_route",
+      p_status_description: "Parcel is on its way.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("outbound_courier")
+      .eq("id", webhookOrderId as string)
+      .single();
+    expect(order?.outbound_courier).toBe("Royal Mail");
+  });
+});
+
 describe("apply_sendcloud_poll_result() — null actor_id for the scheduled/hourly poll (20260814)", () => {
   // The design decision this migration exists to resolve: a pg_cron
   // -triggered scheduled poll has no human behind it, so there is no real

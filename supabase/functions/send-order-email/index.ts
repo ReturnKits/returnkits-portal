@@ -154,6 +154,19 @@ const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_s
 // revisit if actual return-leg transit times suggest a different number.
 const RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS = 2;
 
+// Estimated delivery shown on the DISPATCHED email (added 20260820,
+// replacing the courier name / tracking number / track button that used to
+// be shown there -- see CLAUDE.md's "Dispatched email simplified" entry).
+// Same reasoning as RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS above: no live
+// carrier ETA is available at the moment this fires (labels are bought
+// manually in Sendcloud's dashboard -- see CLAUDE.md's "Phase 6 is
+// tracking-only" note -- so there's no synchronous rate/ETA call in this
+// flow), so this is a plain working-day estimate off today's date via the
+// same add_working_days() SQL helper. Judgment call, not derived from real
+// delivery-time data; revisit if actual outbound transit times suggest a
+// different number.
+const DISPATCHED_ESTIMATED_DELIVERY_WORKING_DAYS = 2;
+
 // Simple substring match on the free-text courier field -- outbound_courier
 // isn't an enum (Sendcloud/Retool can type anything in), so this is a best
 // -effort hint for which carrier-specific guidance link to show, not a
@@ -461,8 +474,7 @@ function buildDispatchedEmail(props: {
   kitLabel: string;
   serviceType: string;
   courier: string;
-  trackingNumber: string;
-  trackingUrl: string | null;
+  estimatedDeliveryDate: string | null;
   employeeName: string | null;
   employeeAddress: string | null;
 }): string {
@@ -472,11 +484,17 @@ function buildDispatchedEmail(props: {
   // reading this isn't the recipient, so show them who/where it's going.
   const shippingBlock = !isReturn && props.employeeName ? destinationBlock("Shipping to", props.employeeName, props.employeeAddress ?? "") : "";
 
-  const trackingBlock = `
-    ${field("Courier", props.courier)}
-    ${field("Tracking number", props.trackingNumber)}
-    ${props.trackingUrl ? trackButton(props.trackingUrl) : ""}
-  `;
+  // Courier name + tracking number + track button removed 20260820 (direct
+  // user request) in favour of a plain estimated-delivery line -- see
+  // DISPATCHED_ESTIMATED_DELIVERY_WORKING_DAYS above. Same "around ...
+  // estimates can shift" caveat style as the return_in_transit email, for
+  // the same reason: this is a working-day estimate, not a carrier-sourced
+  // promise. `props.courier` is still passed through and used below, in the
+  // return-order "sending it back" instructions only -- it's no longer
+  // displayed as its own field.
+  const etaLine = props.estimatedDeliveryDate
+    ? `<p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">Estimated delivery: around ${escapeHtml(formatDate(props.estimatedDeliveryDate))}. Courier estimates can shift by a day or so.</p>`
+    : "";
 
   const guidanceUrl = courierGuidanceUrl(props.courier);
 
@@ -502,7 +520,7 @@ function buildDispatchedEmail(props: {
     <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Your kit is on its way</h1>
     <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} has been dispatched.</p>
     ${shippingBlock}
-    ${trackingBlock}
+    ${etaLine}
     ${nextStepsBlock}
   `;
 
@@ -1018,14 +1036,32 @@ async function handleRequest(req: Request): Promise<Response> {
     });
   } else if (type === "dispatched") {
     subject = `Your kit is on its way — ${o.reference}`;
+
+    // No live carrier ETA is available at this point (labels are bought
+    // manually in Sendcloud's dashboard -- see CLAUDE.md's "Phase 6 is
+    // tracking-only" note -- so there's no synchronous rate/ETA call here).
+    // Same fallback pattern as the return_in_transit branch below: a plain
+    // working-day estimate off today's date via the add_working_days() SQL
+    // helper.
+    let estimatedDeliveryDate: string | null = null;
+    try {
+      const { data: fallbackDate } = await supabase.rpc("add_working_days", {
+        p_start: new Date().toISOString().slice(0, 10),
+        p_n: DISPATCHED_ESTIMATED_DELIVERY_WORKING_DAYS,
+      });
+      estimatedDeliveryDate = typeof fallbackDate === "string" ? fallbackDate : null;
+    } catch (err) {
+      captureError(err, { function: "send-order-email", orderId: o.id, step: "add_working_days fallback (dispatched)" });
+      estimatedDeliveryDate = null;
+    }
+
     html = buildDispatchedEmail({
       companyName: o.company.name,
       reference: o.reference,
       kitLabel: o.kit_types?.label ?? "Kit",
       serviceType: o.service_type,
-      courier: o.outbound_courier ?? "Courier",
-      trackingNumber: o.outbound_tracking_number ?? "—",
-      trackingUrl: o.outbound_tracking_url,
+      courier: o.outbound_courier ?? "your courier",
+      estimatedDeliveryDate,
       employeeName: resolvedEmployee.name,
       employeeAddress,
     });
