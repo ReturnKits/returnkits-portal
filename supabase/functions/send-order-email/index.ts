@@ -484,6 +484,22 @@ function trackButton(url: string): string {
 // when notify_employee is off and there's no other channel to deliver
 // these instructions through. Factored out 20260820 during the logic
 // review below rather than duplicated across both templates.
+//
+// Home-collection line (added 20260821, same day as the wider Royal Mail
+// return-model change): free drop-off is still the default numbered steps
+// above, but the employee can instead scan the QR code already printed on
+// the physical instruction card in the box to self-book a Royal Mail home
+// collection for 30p (Royal Mail's real "Parcel Collect" service, booked
+// at royalmail.com/collection -- confirmed via web search, and explicitly
+// NOT the same product as Royal Mail's own "Labels to Go" QR code, which
+// does label printing at a shop rather than booking a collection -- see
+// the CLAUDE.md entry for this feature). No QR image is generated here --
+// the card is already physically in the box, confirmed by the user -- this
+// is purely a one-line pointer to it. ReturnKits has no visibility into
+// whether this option gets used (no booking-time signal from Royal Mail),
+// and the 30p is charged by Royal Mail directly to the employee -- zero
+// financial involvement for ReturnKits either way, so nothing here needs
+// to touch pricing/invoicing.
 function dropOffSteps(courier: string): string {
   const guidanceUrl = courierGuidanceUrl(courier);
   const isDpd = courier.toLowerCase().includes("dpd");
@@ -496,6 +512,9 @@ function dropOffSteps(courier: string): string {
         : `Drop it off with ${escapeHtml(courier)}`,
     ])}
     ${guidanceUrl ? `<p style="margin:0 0 20px;"><a href="${escapeHtml(guidanceUrl)}" style="color:#2563eb;font-size:13px;text-decoration:none;font-weight:600;">${isDpd ? "Arrange a DPD collection" : "Find a drop-off point"} →</a></p>` : ""}
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">
+      Prefer someone to collect it instead? Scan the QR code on the instruction card inside the box to book a Royal Mail home collection for 30p — pick a day you know you'll be in.
+    </p>
   `;
 }
 
@@ -545,10 +564,15 @@ function buildDispatchedEmail(props: {
   if (!isReturn) {
     nextStepsBlock = `<p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">Nothing further to do on your end once it arrives with the new starter — we'll follow up to confirm.</p>`;
   } else {
+    // Genericized 20260821 alongside the reminder copy -- "pack and post"
+    // assumed drop-off specifically, which is no longer the only option
+    // now that a QR code in the box lets the employee self-book a 30p
+    // Royal Mail home collection instead. See dropOffSteps()'s own comment
+    // for the full context.
     const methodLine =
       props.returnMethod === "collection" && props.collectionDate
         ? `A courier will collect the old device from ${employeeDisplay} around ${escapeHtml(formatDate(props.collectionDate))}. Courier estimates can shift by a day or so.`
-        : `${employeeDisplay} has everything needed to pack and post the device back, including a prepaid return label.`;
+        : `${employeeDisplay} has everything needed to send the device back, including a prepaid return label and a QR code to book a home collection instead, if that's easier.`;
 
     if (props.notifyEmployee) {
       nextStepsBlock = `
@@ -838,37 +862,105 @@ function buildEmployeeDispatchedEmail(props: {
 // is deliberately reassuring rather than instructional. No device_reference
 // here, unlike the customer copy -- an employee only ever has one open
 // return of their own, so there's nothing to disambiguate.
+//
+// isFollowUp (added 20260820, same day): the first nudge and every nudge
+// after it used to be byte-for-byte identical -- orders_needing_checkin()
+// just re-fires the same email every 3 days for as long as the order sits
+// in 'dispatched'/hasn't been collected, with no sense of "we've already
+// asked." Direct user request: escalate tone on the repeat sends so the
+// employee actually notices it's still open, without turning the first,
+// perfectly reasonable reminder into something naggy. Deliberately a single
+// escalated tier (not first/second/third/... each firmer) -- this project's
+// own established discipline is to accept the smallest defensible v1 rather
+// than build an unbounded tone ladder nobody asked for; every send from the
+// second onward reuses the same escalated copy.
+//
+// The two branches escalate differently on purpose, not symmetrically: for
+// drop-off, whether it goes back is genuinely the employee's own action, so
+// the escalated copy can reasonably ask them to act and explain why it
+// matters (security, accountability for company hardware). For collection,
+// the employee has nothing left to do -- a missed pickup is a courier/ops
+// problem -- so escalating by pressuring them would be both unfair and
+// inaccurate; instead it just makes clear the issue is still open and asks
+// for one small assist (make sure it's somewhere obviously collectable)
+// rather than implying they're at fault.
 function buildEmployeeCheckinSentEmail(props: {
   employeeName: string;
+  companyName: string | null;
   returnMethod: "drop_off" | "collection";
   collectionDate: string | null;
+  isFollowUp: boolean;
 }): string {
   const isCollectionOverdue = props.returnMethod === "collection";
+  const companyDisplay = props.companyName ? escapeHtml(props.companyName) : "your old employer";
 
   let previewText: string;
   let body: string;
 
   if (isCollectionOverdue) {
-    previewText = "We're following up on your collection";
     const dateLine = props.collectionDate ? ` around ${escapeHtml(formatDate(props.collectionDate))}` : "";
-    body = `
-      <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">We're following up on your collection</h1>
-      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-        Hi ${escapeHtml(props.employeeName)}, a courier was due to collect your old device${dateLine}, but it doesn't look like that's happened yet.
-      </p>
-      <p style="font-size:14px;line-height:22px;color:#374151;margin:0;">
-        Nothing for you to do differently — just keep it packed and ready to hand over. We're chasing this up and will let you know if anything changes.
-      </p>
-    `;
+    if (props.isFollowUp) {
+      previewText = "Still following up on your collection";
+      body = `
+        <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Still following up on your collection</h1>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Hi ${escapeHtml(props.employeeName)}, we flagged this before — the courier still hasn't collected your old device${dateLine}.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Nothing different needed from you — just keep it packed and ready to hand over. We're continuing to chase this directly with the courier.
+        </p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0;">
+          One thing that can help: if it's somewhere obviously collectable (not tucked away), that makes a rescheduled pickup more likely to succeed first time.
+        </p>
+      `;
+    } else {
+      previewText = "We're following up on your collection";
+      body = `
+        <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">We're following up on your collection</h1>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Hi ${escapeHtml(props.employeeName)}, a courier was due to collect your old device${dateLine}, but it doesn't look like that's happened yet.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0;">
+          Nothing for you to do differently — just keep it packed and ready to hand over. We're chasing this up and will let you know if anything changes.
+        </p>
+      `;
+    }
   } else {
-    previewText = "Just a reminder — please post your device back";
-    body = `
-      <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
-      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-        Hi ${escapeHtml(props.employeeName)}, when you get a chance, please pop your old device in the post
-        using the prepaid label included in the box we sent you. No need to let anyone know once it's done.
-      </p>
-    `;
+    if (props.isFollowUp) {
+      // Same genericization as the first-send branch below -- "posting"
+      // assumed drop-off, which is no longer the only option.
+      previewText = "Still outstanding — please send your device back";
+      body = `
+        <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Still waiting on this one</h1>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Hi ${escapeHtml(props.employeeName)}, we sent a reminder about this already, but we still haven't had your old device back from ${companyDisplay}.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Everything you need to get it back to us is already in the box — no need to let us know once it's done.
+        </p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0;">
+          Getting old company devices back promptly matters — it keeps them secure and properly accounted for, and closes this out for you.
+        </p>
+      `;
+    } else {
+      // Genericized 20260821, direct follow-up from the same conversation
+      // as the Royal Mail return-model change: this used to say "please pop
+      // it in the post," which assumed drop-off specifically. Since the
+      // employee may instead have scanned the QR code in the box to book a
+      // 30p Royal Mail home collection -- and we have no visibility into
+      // which they picked (see the QR/return-model CLAUDE.md entry) -- the
+      // reminder can no longer assume either. "Everything you need is
+      // already in the box" covers both the prepaid label (drop-off) and
+      // the QR code (home collection) without committing to one.
+      previewText = "Just a reminder — please send your device back";
+      body = `
+        <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Hi ${escapeHtml(props.employeeName)}, when you get a chance, please get your old device back to us —
+          everything you need is already in the box, whichever option's easiest for you. No need to let anyone know once it's done.
+        </p>
+      `;
+    }
   }
   return layout(previewText, body);
 }
@@ -901,12 +993,36 @@ async function sendEmployeeCopy(props: {
   if (!props.employeeEmail || !props.employeeName) return;
 
   const recipient = props.employeeEmail;
+
+  // isFollowUp (added 20260820): does this employee already have at least
+  // one prior sent/delivered checkin_sent nudge for this exact order? If
+  // so, escalate tone -- see buildEmployeeCheckinSentEmail's own comment
+  // for why this is one escalated tier, not an increasing ladder, and why
+  // the two return_method branches escalate differently. Doesn't apply to
+  // 'dispatched' -- that's a one-shot send, there's no "follow-up" case for it.
+  let isFollowUp = false;
+  if (props.type === "checkin_sent") {
+    const { data: priorSends } = await supabase
+      .from("communication_log")
+      .select("id")
+      .eq("type", "checkin_sent")
+      .eq("audience", "employee")
+      .eq("order_id", props.order.id)
+      .in("status", ["sent", "delivered"])
+      .limit(1);
+    isFollowUp = !!priorSends && priorSends.length > 0;
+  }
+
   const subject =
     props.type === "dispatched"
       ? "A ReturnKits box is on its way to you"
       : props.returnMethod === "collection"
-        ? "We're following up on your collection"
-        : "Just a reminder — please post your device back";
+        ? isFollowUp
+          ? "Still following up on your collection"
+          : "We're following up on your collection"
+        : isFollowUp
+          ? "Still outstanding — please send your device back"
+          : "Just a reminder — please send your device back";
 
   // One-shot for dispatched, scoped to this order specifically (not
   // bundle-aware like the customer confirmation -- an employee only cares
@@ -959,8 +1075,10 @@ async function sendEmployeeCopy(props: {
         })
       : buildEmployeeCheckinSentEmail({
           employeeName: props.employeeName,
+          companyName: props.order.company.name,
           returnMethod: props.returnMethod,
           collectionDate: props.collectionDate,
+          isFollowUp,
         });
 
   try {
