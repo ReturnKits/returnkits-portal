@@ -5,7 +5,15 @@
 //   1. From Postgres triggers on `orders` (payment_status -> paid,
 //      fulfilment_status -> dispatched), via pg_net.http_post -- see the
 //      Phase 5 trigger migration.
-//   2. From the pg_cron check-in job (checkin_sent / checkin_received).
+//   2. From the pg_cron check-in job (checkin_sent).
+//
+// checkin_received ("has your kit arrived?", ship_to_new_employee orders)
+// was removed 20260827: Sendcloud's "delivered" auto-complete (webhook +
+// hourly scheduled poll fallback) already closes these orders out
+// automatically off the outbound leg's tracking, making the manual
+// "please confirm in your portal" ask redundant with a working automated
+// signal rather than a needed safety net. See CLAUDE.md's "check-in
+// reminders routed to the employee first" entry for the full reasoning.
 //
 // return_confirmed (added, then removed same week) briefly closed the loop
 // for return orders once a customer self-reported posting the device back.
@@ -48,7 +56,7 @@
 // Idempotency: checked at the application level (query communication_log
 // before sending) rather than a DB unique constraint, because the shape of
 // "duplicate" differs by type -- one-shot for order_confirmation/dispatched,
-// but checkin_* are expected to legitimately repeat over an order's life
+// but checkin_sent is expected to legitimately repeat over an order's life
 // (a fresh nudge every few working days) and get their own dedupe scheme
 // (the 3-day cooldown in orders_needing_checkin()).
 
@@ -153,9 +161,9 @@ if (!supabaseUrl || !serviceRoleKey || !resendApiKey) {
 
 const supabase = createClient(supabaseUrl ?? "", serviceRoleKey ?? "");
 
-type EmailType = "order_confirmation" | "dispatched" | "checkin_sent" | "checkin_received" | "return_in_transit";
+type EmailType = "order_confirmation" | "dispatched" | "checkin_sent" | "return_in_transit";
 
-const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_sent", "checkin_received", "return_in_transit"];
+const VALID_TYPES: EmailType[] = ["order_confirmation", "dispatched", "checkin_sent", "return_in_transit"];
 
 // Fallback estimate when Sendcloud's tracking payload doesn't carry an
 // expected_delivery_date (added 20260814 for return_in_transit -- see that
@@ -175,6 +183,66 @@ const RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS = 2;
 // delivery-time data; revisit if actual outbound transit times suggest a
 // different number.
 const DISPATCHED_ESTIMATED_DELIVERY_WORKING_DAYS = 2;
+
+// ---- Check-in escalation tier (added 2026-08-26) -------------------------
+//
+// Third "final notice" stage on top of the existing first-send / follow-up
+// pair for the return-order check-in reminder (checkin_sent). Counts how
+// many times this exact type+audience+order combination has already been
+// sent successfully (sent/delivered in communication_log) and adds one --
+// 1 = first send, 2 = the pre-existing escalated follow-up, 3 = final
+// notice, capped at 3 so a 4th, 5th, ... send all stay at tier 3 rather than
+// climbing an unbounded ladder (direct requirement: repeats at the same
+// cadence after the first tier-3 send, never becomes a new indefinite
+// tier 4).
+//
+// Audience-agnostic since 20260827: originally computed separately per
+// audience (customer vs employee), but the employee-first routing change
+// that day made checkin_sent strictly either/or per order -- the employee
+// gets it if eligible (notify_employee on + has an email), otherwise the
+// customer gets it as a fallback, never both for the same send. With only
+// one audience ever receiving a given order's checkin_sent, counting by
+// audience and counting across the whole order converge to the same number
+// in the overwhelming majority of cases, and simplifying to one counter
+// avoids a subtle edge case: if eligibility flips mid-sequence (e.g. staff
+// add a missing employee email between sends), a per-audience counter would
+// have reset the newly-eligible side back to tier 1, silently re-starting
+// the escalation the recipient (whichever one it now is) has actually
+// already been through once.
+type CheckinTier = 1 | 2 | 3;
+
+async function computeCheckinTier(orderId: string): Promise<CheckinTier> {
+  const { data: priorSends } = await supabase
+    .from("communication_log")
+    .select("id")
+    .eq("type", "checkin_sent")
+    .eq("order_id", orderId)
+    .in("status", ["sent", "delivered"]);
+  const priorCount = priorSends?.length ?? 0;
+  return Math.min(priorCount + 1, 3) as CheckinTier;
+}
+
+// Deadline shown in the Tier 3 ("final notice") employee check-in email.
+// Direct requirement: 5 working days from the send date, recomputed fresh on
+// every tier-3 send (same "estimate computed fresh each time" pattern as
+// DISPATCHED_ESTIMATED_DELIVERY_WORKING_DAYS / RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS
+// above) via the same add_working_days() SQL helper. addWorkingDaysFallback()
+// below is a deliberately approximate (no UK bank-holiday awareness)
+// client-side fallback for the rare case that RPC call itself fails -- the
+// alternative would be sending a final-notice email with no deadline at
+// all, which defeats the point of it.
+const CHECKIN_TIER3_DEADLINE_WORKING_DAYS = 5;
+
+function addWorkingDaysFallback(start: Date, n: number): Date {
+  const d = new Date(start);
+  let added = 0;
+  while (added < n) {
+    d.setDate(d.getDate() + 1);
+    const day = d.getDay();
+    if (day !== 0 && day !== 6) added++;
+  }
+  return d;
+}
 
 // Simple substring match on the free-text courier field -- outbound_courier
 // isn't an enum (Sendcloud/Retool can type anything in), so this is a best
@@ -388,8 +456,17 @@ function buildOrderConfirmationEmail(props: {
   returnAddress: ReturnAddress | null;
 }): string {
   const totalExVat = props.lines.reduce((sum, l) => sum + l.priceExVatPence, 0);
-  const vat = Math.round(totalExVat * 0.2);
-  const totalIncVat = totalExVat + vat;
+  // VAT line removed 2026-08-26: ReturnKits' actual VAT rate was set to 0%
+  // in the database on 2026-08-18 (not VAT-registered), and VAT display
+  // language was stripped from the portal and invoice PDF the next day --
+  // this template was missed in that pass and was still hardcoding a local
+  // 20% calculation, showing a live "VAT (20%)" line and a 20%-inflated
+  // total that didn't match what the customer was actually charged. Fixed
+  // the same way the portal/invoice pages were: collapse to a single Total
+  // row rather than computing a rate this template has no real per-line
+  // access to anyway (it isn't sent kit_types.vat_rate/cover_tiers.vat_rate
+  // per line -- and every rate in the DB is 0% regardless).
+  const totalIncVat = totalExVat;
 
   const refs = props.lines.map((l) => l.reference);
   const primaryRef = refs[0] ?? "";
@@ -450,8 +527,7 @@ function buildOrderConfirmationEmail(props: {
     </table>
     <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;">
       ${lineItems}
-      <tr><td style="padding:10px 0 4px;font-size:13px;color:#6b7280;">VAT (20%)</td><td style="padding:10px 0 4px;font-size:13px;color:#111827;text-align:right;">${pence(vat)}</td></tr>
-      <tr><td style="padding:6px 0 0;font-size:15px;color:#111827;font-weight:700;">Total paid</td><td style="padding:6px 0 0;font-size:15px;color:#111827;font-weight:700;text-align:right;">${pence(totalIncVat)}</td></tr>
+      <tr><td style="padding:10px 0 0;font-size:15px;color:#111827;font-weight:700;">Total paid</td><td style="padding:10px 0 0;font-size:15px;color:#111827;font-weight:700;text-align:right;">${pence(totalIncVat)}</td></tr>
     </table>
     ${returnBlock}
     ${shippingBlocks}
@@ -634,7 +710,16 @@ function buildDispatchedEmail(props: {
 // correctly going forward. Collapsing those two into one message would
 // have repeated the same inaccuracy problem the 'notified' claim itself
 // would have had if shown unconditionally.
-type CheckinSentEmployeeStatus = "notified" | "notify_off" | "no_email";
+//
+// Narrowed to two values 20260827: the employee-first routing change that
+// day means the customer only ever receives checkin_sent when the employee
+// ISN'T being notified directly (notify_employee off, or no email on file)
+// -- when the employee IS eligible, they get it instead and the customer
+// gets nothing for this event. "notified" is therefore no longer a state
+// the customer-facing template can ever be asked to render; the branch was
+// removed outright rather than left dead, matching this project's own
+// practice elsewhere (see confirm_sent's full removal).
+type CheckinSentEmployeeStatus = "notify_off" | "no_email";
 
 // "Kit" on its own is ambiguous once a company has more than one return in
 // flight -- device_reference (asset tag / serial, optional at order
@@ -668,11 +753,49 @@ function buildCheckinSentEmail(props: {
   employeeStatus: CheckinSentEmployeeStatus;
   returnMethod: "drop_off" | "collection";
   collectionDate: string | null;
+  tier: CheckinTier;
 }): string {
   const employeeDisplay = escapeHtml(props.employeeName ?? "the recipient");
   const itemLabel = deviceLabel(props.kitLabel, props.deviceReference);
   const employeeDirectoryLink = `<a href="${PORTAL_URL}/employees" style="color:#2563eb;text-decoration:none;">employee directory</a>`;
   const isCollectionOverdue = props.returnMethod === "collection";
+
+  // Tier 3 ("final notice", added 2026-08-26): unified copy regardless of
+  // return_method -- direct requirement ("both order types") -- unlike
+  // tiers 1/2 below, which still branch on drop-off vs collection.
+  // Employee-status-aware, same split used everywhere else in this file --
+  // narrowed to two branches 20260827 (see CheckinSentEmployeeStatus's own
+  // comment): the "notified" case can't occur here anymore, since a
+  // notified employee is the one getting emailed directly now, not the
+  // customer.
+  if (props.tier === 3) {
+    let bodyHtml: string;
+    if (props.employeeStatus === "notify_off") {
+      bodyHtml = `
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          ${escapeHtml(props.kitLabel)} still isn't back with us after several reminders on our end. We haven't been able to remind ${employeeDisplay} directly, since employee notifications weren't turned on for this order.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0;">
+          This is a final nudge before we flag it as outstanding — you may want to follow up with them directly.
+        </p>
+      `;
+    } else {
+      bodyHtml = `
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          ${escapeHtml(props.kitLabel)} still isn't back with us after several reminders on our end. We don't have an email on file for ${employeeDisplay}, so we haven't been able to remind them directly.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0;">
+          This is a final nudge before we flag it as outstanding — you may want to follow up with them directly, or add their email from the ${employeeDirectoryLink} so future reminders reach them.
+        </p>
+      `;
+    }
+    const tier3Body = `
+      <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
+      <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Still outstanding</h1>
+      ${bodyHtml}
+    `;
+    return layout(`Still outstanding — ${props.reference}`, tier3Body);
+  }
 
   let heading: string;
   let bodyHtml: string;
@@ -682,9 +805,7 @@ function buildCheckinSentEmail(props: {
     const dateLine = props.collectionDate ? ` around ${escapeHtml(formatDate(props.collectionDate))}` : "";
 
     let followUp: string;
-    if (props.employeeStatus === "notified") {
-      followUp = `We've let ${employeeDisplay} know too — nothing they need to do differently, we're chasing this up with the courier.`;
-    } else if (props.employeeStatus === "notify_off") {
+    if (props.employeeStatus === "notify_off") {
       followUp = `Employee notifications weren't turned on for this order, so ${employeeDisplay} hasn't heard from us about this — you may want to give them a heads-up.`;
     } else {
       followUp = `We don't have an email on file for ${employeeDisplay}, so they haven't heard from us about this — you may want to give them a heads-up. Add their email from the ${employeeDirectoryLink} and future updates will reach them directly.`;
@@ -704,9 +825,7 @@ function buildCheckinSentEmail(props: {
     const baseLine = `We haven't seen ${itemLabel} for ${escapeHtml(props.companyName)} come back to us yet.`;
 
     let followUp: string;
-    if (props.employeeStatus === "notified") {
-      followUp = `We've also sent ${employeeDisplay} a reminder.`;
-    } else if (props.employeeStatus === "notify_off") {
+    if (props.employeeStatus === "notify_off") {
       followUp = `You may want to follow up with ${employeeDisplay} directly — employee notifications weren't turned on for this order.`;
     } else {
       followUp = `You may want to follow up with ${employeeDisplay} directly — we don't have an email on file for them. Add one from the ${employeeDirectoryLink} and future reminders will reach them directly.`;
@@ -728,20 +847,6 @@ function buildCheckinSentEmail(props: {
     ? `Collection check — ${props.reference}`
     : `Reminder: please send your kit back — ${props.reference}`;
   return layout(previewText, body);
-}
-
-// ---- Check-in: has it arrived? (ship-to-new-employee orders) ------------
-
-function buildCheckinReceivedEmail(props: { companyName: string; reference: string; kitLabel: string }): string {
-  const body = `
-    <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
-    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just checking in</h1>
-    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-      ${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} was dispatched a little while ago.
-      Could you confirm in your portal once it's arrived with the new starter? That closes the order out on our end.
-    </p>
-  `;
-  return layout(`Has the kit arrived? — ${props.reference}`, body);
 }
 
 // ---- Return in transit (return orders, added 20260814) ------------------
@@ -801,7 +906,8 @@ function buildReturnInTransitEmail(props: {
 // the explicit "I don't want the employee to get order details" ask. Only
 // built for 'dispatched' and 'checkin_sent' -- see the accompanying
 // migration's comment for why those two specifically and not
-// order_confirmation / checkin_received.
+// order_confirmation. (checkin_received no longer exists at all as of
+// 20260827 -- see the top-of-file comment.)
 
 function buildEmployeeDispatchedEmail(props: {
   employeeName: string;
@@ -889,17 +995,71 @@ function buildEmployeeCheckinSentEmail(props: {
   companyName: string | null;
   returnMethod: "drop_off" | "collection";
   collectionDate: string | null;
-  isFollowUp: boolean;
+  tier: CheckinTier;
+  deadlineDate: string | null;
 }): string {
   const isCollectionOverdue = props.returnMethod === "collection";
   const companyDisplay = props.companyName ? escapeHtml(props.companyName) : "your old employer";
+  const deadlineDisplay = props.deadlineDate ? escapeHtml(formatDate(props.deadlineDate)) : "the date below";
 
   let previewText: string;
   let body: string;
 
+  // Tier 3 ("final notice", added 2026-08-26): fires on the 3rd send onward
+  // for this order+audience and repeats at the same cadence after that (see
+  // computeCheckinTier()'s capping comment) -- this is the escalation
+  // ceiling, not a new indefinite tier 4. Adds three things tier 1/2 never
+  // had: a real deadline date, an explicit invitation to reply if something's
+  // actually wrong (lost/damaged/etc -- the sequence had no way for the
+  // employee to signal that before), and a plain statement that the company
+  // will be told if it's still outstanding past the deadline. The collection
+  // variant deliberately keeps tier 2's "not your fault" framing rather than
+  // switching to pressure -- a missed pickup is still a courier/ops problem,
+  // not something to blame the employee for, even at the final stage.
+  if (props.tier === 3) {
+    if (isCollectionOverdue) {
+      previewText = "One last follow-up on your collection";
+      body = `
+        <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">One last follow-up</h1>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Hi ${escapeHtml(props.employeeName)}, we've followed up about this twice now, and the courier still hasn't collected your old device from you. This isn't something you've done wrong — could you make sure it's ready and waiting by ${deadlineDisplay}?
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          If it's easier, you can also rebook the collection yourself using the QR code on the instruction card inside the box.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          If there's a reason this hasn't happened yet — device is lost, damaged, or something else — just reply and let us know, we'll sort it from there.
+        </p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0;">
+          After ${deadlineDisplay}, we'll need to let ${companyDisplay} know this is still outstanding.
+        </p>
+      `;
+    } else {
+      previewText = "One last reminder — please send your old device back";
+      body = `
+        <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">One last reminder</h1>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Hi ${escapeHtml(props.employeeName)}, we've reached out about this twice now and still haven't had your old device back from ${companyDisplay}. Could you get it sent by ${deadlineDisplay}?
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          Everything you need is already in the box — pack it, attach the label, and either drop it off or scan the QR code for a home collection.
+        </p>
+        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+          If there's a reason this hasn't happened yet — device is lost, damaged, or something else — just reply and let us know, we'll sort it from there.
+        </p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0;">
+          After ${deadlineDisplay}, we'll need to let ${companyDisplay} know this is still outstanding.
+        </p>
+      `;
+    }
+    return layout(previewText, body);
+  }
+
+  const isFollowUp = props.tier === 2;
+
   if (isCollectionOverdue) {
     const dateLine = props.collectionDate ? ` around ${escapeHtml(formatDate(props.collectionDate))}` : "";
-    if (props.isFollowUp) {
+    if (isFollowUp) {
       previewText = "Still following up on your collection";
       body = `
         <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Still following up on your collection</h1>
@@ -926,7 +1086,7 @@ function buildEmployeeCheckinSentEmail(props: {
       `;
     }
   } else {
-    if (props.isFollowUp) {
+    if (isFollowUp) {
       // Same genericization as the first-send branch below -- "posting"
       // assumed drop-off, which is no longer the only option.
       previewText = "Still outstanding — please send your device back";
@@ -994,35 +1154,55 @@ async function sendEmployeeCopy(props: {
 
   const recipient = props.employeeEmail;
 
-  // isFollowUp (added 20260820): does this employee already have at least
-  // one prior sent/delivered checkin_sent nudge for this exact order? If
-  // so, escalate tone -- see buildEmployeeCheckinSentEmail's own comment
-  // for why this is one escalated tier, not an increasing ladder, and why
-  // the two return_method branches escalate differently. Doesn't apply to
-  // 'dispatched' -- that's a one-shot send, there's no "follow-up" case for it.
-  let isFollowUp = false;
+  // tier (added 20260820, extended to a 3rd stage 20260826, made
+  // audience-agnostic 20260827): how many prior sent/delivered checkin_sent
+  // nudges does this order already have, across whichever audience actually
+  // received them? See computeCheckinTier()'s own comment for why it counts
+  // rather than just checking existence, why it caps at 3, and why it
+  // stopped filtering by audience -- see buildEmployeeCheckinSentEmail's own
+  // comment for why tier 3 is one escalated ceiling, not an increasing
+  // ladder, and why the two return_method branches escalate differently.
+  // Doesn't apply to 'dispatched' -- that's a one-shot send, there's no
+  // "follow-up" case for it.
+  let tier: CheckinTier = 1;
+  let deadlineDate: string | null = null;
   if (props.type === "checkin_sent") {
-    const { data: priorSends } = await supabase
-      .from("communication_log")
-      .select("id")
-      .eq("type", "checkin_sent")
-      .eq("audience", "employee")
-      .eq("order_id", props.order.id)
-      .in("status", ["sent", "delivered"])
-      .limit(1);
-    isFollowUp = !!priorSends && priorSends.length > 0;
+    tier = await computeCheckinTier(props.order.id);
+    if (tier === 3) {
+      try {
+        const { data: fallbackDate } = await supabase.rpc("add_working_days", {
+          p_start: new Date().toISOString().slice(0, 10),
+          p_n: CHECKIN_TIER3_DEADLINE_WORKING_DAYS,
+        });
+        deadlineDate = typeof fallbackDate === "string" ? fallbackDate : null;
+      } catch (err) {
+        captureError(err, { function: "send-order-email", orderId: props.order.id, step: "add_working_days (checkin tier 3 deadline)" });
+      }
+      if (!deadlineDate) {
+        // Defensive fallback if the RPC itself failed -- see
+        // addWorkingDaysFallback()'s own comment. A tier-3 "final notice"
+        // with no deadline at all defeats the point of the email, so this
+        // degrades to an approximate client-side calculation rather than
+        // sending one without a date.
+        deadlineDate = addWorkingDaysFallback(new Date(), CHECKIN_TIER3_DEADLINE_WORKING_DAYS).toISOString().slice(0, 10);
+      }
+    }
   }
 
   const subject =
     props.type === "dispatched"
       ? "A ReturnKits box is on its way to you"
-      : props.returnMethod === "collection"
-        ? isFollowUp
-          ? "Still following up on your collection"
-          : "We're following up on your collection"
-        : isFollowUp
-          ? "Still outstanding — please send your device back"
-          : "Just a reminder — please send your device back";
+      : tier === 3
+        ? props.returnMethod === "collection"
+          ? "One last follow-up on your collection"
+          : "One last reminder — please send your old device back"
+        : props.returnMethod === "collection"
+          ? tier === 2
+            ? "Still following up on your collection"
+            : "We're following up on your collection"
+          : tier === 2
+            ? "Still outstanding — please send your device back"
+            : "Just a reminder — please send your device back";
 
   // One-shot for dispatched, scoped to this order specifically (not
   // bundle-aware like the customer confirmation -- an employee only cares
@@ -1078,7 +1258,8 @@ async function sendEmployeeCopy(props: {
           companyName: props.order.company.name,
           returnMethod: props.returnMethod,
           collectionDate: props.collectionDate,
-          isFollowUp,
+          tier,
+          deadlineDate,
         });
 
   try {
@@ -1378,27 +1559,59 @@ async function handleRequest(req: Request): Promise<Response> {
       collectionDate: o.collection_date,
     });
   } else if (type === "checkin_sent") {
+    // Employee-first routing (added 20260827, direct user request): the
+    // portal's own communication log already gives the ordering company
+    // full visibility into an order's status, so they shouldn't also be
+    // emailed about it when the employee -- who has no portal access at
+    // all -- can be reminded directly instead. Exactly one audience ever
+    // receives a given checkin_sent send: the employee if eligible
+    // (notify_employee on + has an email on file), otherwise the customer
+    // as a fallback, so an order is never left completely unreminded just
+    // because the employee channel isn't available. Computed here first,
+    // mirroring sendEmployeeCopy()'s own eligibility check exactly, so the
+    // two can never disagree about which audience gets it.
+    const employeeEligible = o.notify_employee && !!resolvedEmployee.email;
+
+    if (employeeEligible) {
+      await sendEmployeeCopy({
+        type,
+        order: { id: o.id, service_type: o.service_type, company: o.company },
+        employeeEmail: resolvedEmployee.email,
+        employeeName: resolvedEmployee.name,
+        courier: o.outbound_courier,
+        trackingUrl: o.outbound_tracking_url,
+        notifyEmployee: o.notify_employee,
+        returnMethod: o.return_method,
+        collectionDate: o.collection_date,
+      });
+      return new Response(JSON.stringify({ skipped: true, reason: "employee eligible, customer copy suppressed" }), { status: 200 });
+    }
+
     // orders_needing_checkin() (20260820 restructure) now only surfaces a
     // collection-method return here once its collection_date has passed
     // without the leg moving to in_transit/completed -- so by the time
     // this branch runs, o.return_method === "collection" always means
     // "this looks like a missed collection," never "collection is still
     // pending." The subject and template both reflect that directly.
+    // Tier (added 20260826, made audience-agnostic 20260827): counts prior
+    // sent/delivered checkin_sent rows for this order -- see
+    // computeCheckinTier()'s own comment. Tier 3 gets a unified subject
+    // regardless of return_method (direct requirement: "both order types"
+    // share the same tier-3 copy), unlike tiers 1/2 below, which still
+    // branch on drop-off vs collection.
+    const customerTier = await computeCheckinTier(o.id);
     subject =
-      o.return_method === "collection"
-        ? `Collection check — ${o.reference}`
-        : `Reminder: please send your kit back — ${o.reference}`;
-    // Mirrors sendEmployeeCopy()'s own eligibility check (notify_employee +
-    // employee has an email) but doesn't wait for that send to actually
-    // happen -- this only needs to know whether the system is configured to
-    // also nudge the employee, not confirm delivery, consistent with how
-    // this codebase doesn't retroactively reconcile customer-facing copy
-    // against downstream delivery outcomes anywhere else either.
-    const employeeStatus: CheckinSentEmployeeStatus = !o.notify_employee
-      ? "notify_off"
-      : resolvedEmployee.email
-        ? "notified"
-        : "no_email";
+      customerTier === 3
+        ? `Still outstanding — ${resolvedEmployee.name ?? "the recipient"}'s device`
+        : o.return_method === "collection"
+          ? `Collection check — ${o.reference}`
+          : `Reminder: please send your kit back — ${o.reference}`;
+    // Reaching this point already proves !employeeEligible, so
+    // employeeStatus can only ever be notify_off or no_email here -- see
+    // CheckinSentEmployeeStatus's own comment for why "notified" was
+    // removed as a possible value entirely rather than left theoretically
+    // reachable.
+    const employeeStatus: CheckinSentEmployeeStatus = !o.notify_employee ? "notify_off" : "no_email";
     html = buildCheckinSentEmail({
       companyName: o.company.name,
       reference: o.reference,
@@ -1408,10 +1621,8 @@ async function handleRequest(req: Request): Promise<Response> {
       employeeStatus,
       returnMethod: o.return_method,
       collectionDate: o.collection_date,
+      tier: customerTier,
     });
-  } else if (type === "checkin_received") {
-    subject = `Has your kit arrived? — ${o.reference}`;
-    html = buildCheckinReceivedEmail({ companyName: o.company.name, reference: o.reference, kitLabel: o.kit_types?.label ?? "Kit" });
   } else {
     // return_in_transit: prefer the caller's resolved date (sourced from
     // Sendcloud's expected_delivery_date on the tracking payload), fall

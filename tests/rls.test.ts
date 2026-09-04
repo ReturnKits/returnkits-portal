@@ -3274,7 +3274,19 @@ describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown
     expect(match).toBeUndefined();
   });
 
-  it("✗ a ship-to-new-employee order that was just dispatched is not yet due a nudge", async () => {
+  it("✗ a ship-to-new-employee order is never surfaced by orders_needing_checkin, even long past what would clear a return order's SLA", async () => {
+    // Restructured 20260827 (migration 20260827100000): the
+    // ship_to_new_employee branch was removed from orders_needing_checkin()
+    // entirely, not merely left with a not-yet-met SLA -- the "has it
+    // arrived?" reminder this branch used to feed is retired in favour of
+    // Sendcloud's existing delivered-auto-completes-the-order signal (both
+    // the real-time webhook and the hourly scheduled poll fallback). This
+    // backdates the order well past the 5-working-day return-order SLA
+    // specifically to prove the exclusion is unconditional on service_type,
+    // not merely a timing coincidence -- the old version of this test only
+    // proved "not yet due," which would have kept passing even if the
+    // service_type filter were accidentally dropped, as long as the order
+    // was recently dispatched.
     const shipEmail = uniqueEmail("checkin-elig-ship");
     const shipUser = await createAuthUser(shipEmail);
     await createProfile(shipUser.id, company.id, shipEmail, "company_admin");
@@ -3298,7 +3310,7 @@ describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown
       .from("orders")
       .update({
         fulfilment_status: "dispatched",
-        fulfilment_log: [{ at: new Date().toISOString(), action: "dispatched", detail: {}, actor_id: shipUser.id }],
+        fulfilment_log: [{ at: "2026-08-01T09:00:00+00:00", action: "dispatched", detail: {}, actor_id: shipUser.id }],
       })
       .eq("id", newOrderId as string);
 
@@ -3308,6 +3320,13 @@ describe("orders_needing_checkin() — dispatch-to-nudge SLA + re-nudge cooldown
 
     await adminClient.from("orders").delete().eq("id", newOrderId as string);
     await deleteAuthUserByEmail(shipEmail);
+  });
+
+  it("✗ orders_needing_checkin never returns checkin_type='checkin_received' for any order (type retired 20260827)", async () => {
+    const { data, error } = await adminClient.rpc("orders_needing_checkin");
+    expect(error).toBeNull();
+    const types = new Set((data as { order_id: string; checkin_type: string }[]).map((r) => r.checkin_type));
+    expect(types.has("checkin_received")).toBe(false);
   });
 });
 
