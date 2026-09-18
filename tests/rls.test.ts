@@ -5765,3 +5765,556 @@ describe("return_method / collection_date on return orders (added 20260820)", ()
     });
   });
 });
+
+describe("Multi-parcel tracking — order_tracking_numbers + add/remove RPCs + Sendcloud matching (20260918)", () => {
+  // Direct user request: "CAN I HAVE THE OPTION TO ADD ADDITIONAL TRACKING TO
+  // AN ORDER?" -- confirmed via two rounds of AskUserQuestion to mean
+  // genuine "one order, multiple simultaneous parcels" support (2+ boxes on
+  // the same leg), not tracking-number replacement/history (which already
+  // has a natural home in fulfilment_log). The user's own scoping answer:
+  // "JUST ADD ADDITIONAL TRACKING IF MORE THAN 1 TRAACKING NUMBER AS WELL AS
+  // ADDITIONA STATUS TIMELINE IF MORE THAN 1" -- keep the existing primary
+  // outbound_*/return_* columns completely untouched (this is proven
+  // separately by every describe block above continuing to pass unmodified),
+  // add a small side table for genuinely-extra parcels, each with its own
+  // independent status/status_log. See migrations
+  // 20260918130000_order_tracking_numbers.sql and
+  // 20260918131500_sendcloud_matching_for_extra_parcels.sql.
+  let companyA: { id: string };
+  let companyB: { id: string };
+  const custAEmail = uniqueEmail("mp-cust-a");
+  const custBEmail = uniqueEmail("mp-cust-b");
+  const staffEmail = uniqueEmail("mp-staff");
+  let staffId: string;
+  let employeeA: { id: string };
+  let addressA: { id: string };
+  let shipOrderId: string; // ship_to_new_employee — outbound leg only, no return leg
+  let returnOrderId: string; // return — has both legs
+
+  beforeAll(async () => {
+    companyA = await createCompany("Multi-Parcel Test Co A");
+    companyB = await createCompany("Multi-Parcel Test Co B");
+
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const custA = await createAuthUser(custAEmail);
+    await createProfile(custA.id, companyA.id, custAEmail, "company_admin");
+    const custB = await createAuthUser(custBEmail);
+    await createProfile(custB.id, companyB.id, custBEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: companyA.id, full_name: "Multi Parcel Test", email: "multi-parcel@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employeeA = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: companyA.id, label: "HQ", address_line1: "1 Test St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+    addressA = addr as { id: string };
+
+    const client = await clientAsUser(custAEmail);
+
+    const { data: shipId, error: shipError } = await client.rpc("create_order", {
+      p_kit_type_id: "phone",
+      p_service_type: "ship_to_new_employee",
+      p_employee_id: employeeA.id,
+    });
+    if (shipError) throw shipError;
+    shipOrderId = shipId as string;
+
+    const { data: returnId, error: returnError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employeeA.id,
+      p_return_address_id: addressA.id,
+    });
+    if (returnError) throw returnError;
+    returnOrderId = returnId as string;
+
+    // Both orders fast-forwarded to 'dispatched' with a primary tracking
+    // number each -- same shortcut used throughout the Phase 6 describe
+    // blocks -- so the Sendcloud-matching tests below have a clean known
+    // starting state to fall through past before reaching the new
+    // extra-parcel branch.
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", outbound_tracking_number: `MP-SHIP-PRIMARY-${Date.now()}` })
+      .eq("id", shipOrderId);
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "dispatched",
+        outbound_tracking_number: `MP-RET-OUT-PRIMARY-${Date.now()}`,
+        return_tracking_number: `MP-RET-RET-PRIMARY-${Date.now()}`,
+      })
+      .eq("id", returnOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().in("company_id", [companyA.id, companyB.id]);
+    for (const email of [custAEmail, custBEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().in("id", [companyA.id, companyB.id]);
+  });
+
+  describe("RLS on order_tracking_numbers", () => {
+    let rowId: string;
+
+    beforeAll(async () => {
+      const { data, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: `MP-RLS-${Date.now()}`,
+      });
+      if (error) throw error;
+      rowId = data as string;
+    });
+
+    it("✗ is unreachable via a genuine anon-key client", async () => {
+      const { data, error } = await anonClient.from("order_tracking_numbers").select("*").limit(1);
+      expect(data).toBeNull();
+      expect(error).not.toBeNull();
+    });
+
+    it("✓ company A's own signed-in user can read the row via RLS", async () => {
+      const client = await clientAsUser(custAEmail);
+      const { data, error } = await client.from("order_tracking_numbers").select("id").eq("id", rowId);
+      expect(error).toBeNull();
+      expect(data).toHaveLength(1);
+    });
+
+    it("✗ company B's signed-in user cannot read company A's extra-parcel row", async () => {
+      const client = await clientAsUser(custBEmail);
+      const { data, error } = await client.from("order_tracking_numbers").select("id").eq("id", rowId);
+      expect(error).toBeNull(); // RLS filters silently, doesn't error
+      expect(data).toHaveLength(0);
+    });
+  });
+
+  describe("add_order_tracking_number RPC", () => {
+    it("✗ rejects a call from a signed-in customer (not service_role)", async () => {
+      const client = await clientAsUser(custAEmail);
+      const { error } = await client.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: `MP-REJECT-${Date.now()}`,
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it("✗ rejects an actor who isn't internal staff", async () => {
+      const client = await clientAsUser(custAEmail);
+      const { data: custRow } = await client.from("users").select("id").eq("email", custAEmail).single();
+      const { error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: (custRow as { id: string }).id,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: `MP-BADACTOR-${Date.now()}`,
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/not an internal staff member/);
+    });
+
+    it("✗ rejects an invalid leg value", async () => {
+      const { error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_leg: "sideways",
+        p_courier: "DPD",
+        p_tracking_number: `MP-BADLEG-${Date.now()}`,
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/Invalid leg/);
+    });
+
+    it("✗ rejects a blank tracking number", async () => {
+      const { error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: "   ",
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/tracking number is required/);
+    });
+
+    it("✗ rejects a non-existent order", async () => {
+      const { error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: crypto.randomUUID(),
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: `MP-NOORDER-${Date.now()}`,
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/not found/);
+    });
+
+    it("✗ rejects leg:'return' on a ship_to_new_employee order — it has no return leg", async () => {
+      const { error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_leg: "return",
+        p_courier: "DPD",
+        p_tracking_number: `MP-NORETURNLEG-${Date.now()}`,
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/has no return leg/);
+    });
+
+    it("✓ successfully adds a 2nd outbound parcel to the return order, and it's readable back", async () => {
+      const trackingNumber = `MP-ADD-OUT-${Date.now()}`;
+      const { data: id, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: returnOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: trackingNumber,
+        p_tracking_url: "https://track.example.com/" + trackingNumber,
+      });
+      expect(error).toBeNull();
+      expect(id).toBeTruthy();
+
+      const { data: row } = await adminClient
+        .from("order_tracking_numbers")
+        .select("leg, courier, tracking_number, tracking_url, status, status_log")
+        .eq("id", id as string)
+        .single();
+      expect(row?.leg).toBe("outbound");
+      expect(row?.courier).toBe("DPD");
+      expect(row?.tracking_number).toBe(trackingNumber);
+      expect(row?.status).toBe("awaiting_scan");
+      expect(row?.status_log).toEqual([]);
+    });
+
+    it("✓ successfully adds a 2nd return parcel to the return order", async () => {
+      const { data: id, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: returnOrderId,
+        p_actor_id: staffId,
+        p_leg: "return",
+        p_courier: "Royal Mail",
+        p_tracking_number: `MP-ADD-RET-${Date.now()}`,
+      });
+      expect(error).toBeNull();
+
+      const { data: row } = await adminClient.from("order_tracking_numbers").select("leg").eq("id", id as string).single();
+      expect(row?.leg).toBe("return");
+    });
+
+    it("✓ writes an audit_log row for order.add_tracking_number", async () => {
+      const trackingNumber = `MP-AUDIT-${Date.now()}`;
+      const { data: id, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: returnOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: trackingNumber,
+      });
+      expect(error).toBeNull();
+
+      const { data: logRows } = await adminClient
+        .from("audit_log")
+        .select("action, target_table, target_id, actor_id")
+        .eq("target_table", "order_tracking_numbers")
+        .eq("target_id", id as string);
+      expect(logRows).toHaveLength(1);
+      expect(logRows?.[0].action).toBe("order.add_tracking_number");
+      expect(logRows?.[0].actor_id).toBe(staffId);
+    });
+  });
+
+  describe("remove_order_tracking_number RPC", () => {
+    let removableId: string;
+
+    beforeAll(async () => {
+      const { data, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: returnOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: "DPD",
+        p_tracking_number: `MP-REMOVE-${Date.now()}`,
+      });
+      if (error) throw error;
+      removableId = data as string;
+    });
+
+    it("✗ rejects a call from a signed-in customer (not service_role)", async () => {
+      const client = await clientAsUser(custAEmail);
+      const { error } = await client.rpc("remove_order_tracking_number", {
+        p_tracking_number_id: removableId,
+        p_actor_id: staffId,
+      });
+      expect(error).not.toBeNull();
+    });
+
+    it("✗ rejects a non-existent tracking-number row", async () => {
+      const { error } = await adminClient.rpc("remove_order_tracking_number", {
+        p_tracking_number_id: crypto.randomUUID(),
+        p_actor_id: staffId,
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/not found/);
+    });
+
+    it("✓ successfully removes the row, and a subsequent read confirms it's gone", async () => {
+      const { error } = await adminClient.rpc("remove_order_tracking_number", {
+        p_tracking_number_id: removableId,
+        p_actor_id: staffId,
+      });
+      expect(error).toBeNull();
+
+      const { data } = await adminClient.from("order_tracking_numbers").select("id").eq("id", removableId);
+      expect(data).toHaveLength(0);
+    });
+
+    it("✓ writes an audit_log row for order.remove_tracking_number, with the removed row snapshotted in before", async () => {
+      const { data: logRows } = await adminClient
+        .from("audit_log")
+        .select("action, target_table, target_id, before")
+        .eq("target_table", "order_tracking_numbers")
+        .eq("target_id", removableId);
+      expect(logRows).toHaveLength(1);
+      expect(logRows?.[0].action).toBe("order.remove_tracking_number");
+      expect((logRows?.[0].before as { tracking_number: string })?.tracking_number).toMatch(/^MP-REMOVE-/);
+    });
+  });
+
+  describe("Sendcloud webhook matching (apply_sendcloud_tracking_event) falls through to an extra parcel", () => {
+    let extraTracking: string;
+    let extraParcelId: string;
+
+    beforeAll(async () => {
+      extraTracking = `MP-WEBHOOK-EXTRA-${Date.now()}`;
+      const { data, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_leg: "outbound",
+        p_courier: null,
+        p_tracking_number: extraTracking,
+      });
+      if (error) throw error;
+      extraParcelId = data as string;
+    });
+
+    it("✓ a mapped status_code updates the extra parcel's own status, without touching orders.fulfilment_status", async () => {
+      const before = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+
+      const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_status_code: "en_route",
+        p_status_description: "Parcel is on its way.",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.matched).toBe(true);
+      expect(data?.applied).toBe(true);
+      expect(data?.extra_parcel_id).toBe(extraParcelId);
+      expect(data?.order_id).toBe(shipOrderId);
+      expect(data?.leg).toBe("outbound");
+      expect(data?.new_status).toBe("in_transit");
+
+      const { data: row } = await adminClient
+        .from("order_tracking_numbers")
+        .select("status, courier, status_log")
+        .eq("id", extraParcelId)
+        .single();
+      expect(row?.status).toBe("in_transit");
+      expect(row?.courier).toBe("Royal Mail"); // backfilled from carrier_code, was null
+      expect(row?.status_log).toHaveLength(1);
+
+      const after = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+      expect(after.data?.fulfilment_status).toBe(before.data?.fulfilment_status); // untouched
+    });
+
+    it("✗ replaying the same status is a no-op (already at that status)", async () => {
+      const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_status_code: "en_route",
+        p_status_description: "Parcel is on its way.",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.applied).toBe(false);
+      expect(data?.reason).toMatch(/already at status/);
+    });
+
+    it("✓ a mapped 'delivered' status_code moves the extra parcel to delivered, still not touching the order", async () => {
+      const before = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+
+      const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_status_code: "delivered",
+        p_status_description: "Delivered",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.applied).toBe(true);
+      expect(data?.new_status).toBe("delivered");
+
+      const { data: row } = await adminClient
+        .from("order_tracking_numbers")
+        .select("status, status_log")
+        .eq("id", extraParcelId)
+        .single();
+      expect(row?.status).toBe("delivered");
+      expect(row?.status_log).toHaveLength(2); // in_transit, then delivered
+
+      const after = await adminClient.from("orders").select("fulfilment_status").eq("id", shipOrderId).single();
+      expect(after.data?.fulfilment_status).toBe(before.data?.fulfilment_status); // still untouched
+    });
+
+    it("✗ an unmapped status_code on an extra parcel is matched but not applied", async () => {
+      const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_status_code: "some_totally_unrecognised_status",
+        p_status_description: "?",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.matched).toBe(true);
+      expect(data?.applied).toBe(false);
+      expect(data?.reason).toMatch(/unmapped status_code/);
+    });
+
+    it("✗ a tracking number matching nothing at all — not a primary column, not an extra parcel — returns matched:false", async () => {
+      const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+        p_tracking_number: `MP-NOTHING-MATCHES-${Date.now()}`,
+        p_carrier_code: "royal_mailv2",
+        p_status_code: "en_route",
+        p_status_description: "?",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.matched).toBe(false);
+    });
+  });
+
+  describe("Sendcloud poll matching (apply_sendcloud_poll_result) falls through to an extra parcel", () => {
+    let extraTracking: string;
+    let extraParcelId: string;
+
+    beforeAll(async () => {
+      extraTracking = `MP-POLL-EXTRA-${Date.now()}`;
+      const { data, error } = await adminClient.rpc("add_order_tracking_number", {
+        p_order_id: returnOrderId,
+        p_actor_id: staffId,
+        p_leg: "return",
+        p_courier: null,
+        p_tracking_number: extraTracking,
+      });
+      if (error) throw error;
+      extraParcelId = data as string;
+    });
+
+    it("✓ a real actor_id (manual 'Check tracking now') updates the extra parcel and is recorded as source:'poll'", async () => {
+      const before = await adminClient.from("orders").select("fulfilment_status").eq("id", returnOrderId).single();
+
+      const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+        p_order_id: returnOrderId,
+        p_actor_id: staffId,
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_parent_status: "shipment-on-route",
+        p_status_description: "In transit",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.matched).toBe(true);
+      expect(data?.applied).toBe(true);
+      expect(data?.extra_parcel_id).toBe(extraParcelId);
+      expect(data?.leg).toBe("return");
+      expect(data?.new_status).toBe("in_transit");
+
+      const { data: row } = await adminClient
+        .from("order_tracking_numbers")
+        .select("status_log")
+        .eq("id", extraParcelId)
+        .single();
+      const log = row?.status_log as Array<{ detail?: { source?: string } }>;
+      expect(log).toHaveLength(1);
+      expect(log[0].detail?.source).toBe("poll");
+
+      const after = await adminClient.from("orders").select("fulfilment_status").eq("id", returnOrderId).single();
+      expect(after.data?.fulfilment_status).toBe(before.data?.fulfilment_status); // untouched
+    });
+
+    it("✓ a null actor_id (scheduled hourly poll) is accepted and recorded as source:'scheduled_poll'", async () => {
+      const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+        p_order_id: returnOrderId,
+        p_actor_id: null,
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_parent_status: "delivered",
+        p_status_description: "Delivered",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.applied).toBe(true);
+      expect(data?.new_status).toBe("delivered");
+
+      const { data: row } = await adminClient
+        .from("order_tracking_numbers")
+        .select("status_log")
+        .eq("id", extraParcelId)
+        .single();
+      const log = row?.status_log as Array<{ detail?: { source?: string } }>;
+      expect(log).toHaveLength(2);
+      expect(log[1].detail?.source).toBe("scheduled_poll");
+    });
+
+    it("✗ an invalid (non-internal-staff) actor_id is still rejected — the null-actor exception isn't a blanket bypass", async () => {
+      const client = await clientAsUser(custAEmail);
+      const { data: custRow } = await client.from("users").select("id").eq("email", custAEmail).single();
+      const { error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+        p_order_id: returnOrderId,
+        p_actor_id: (custRow as { id: string }).id,
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_parent_status: "shipment-on-route",
+        p_status_description: "In transit",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).not.toBeNull();
+      expect(error?.message).toMatch(/not an internal staff member/);
+    });
+
+    it("✗ the same tracking number under the WRONG order_id does not match — extra-parcel lookup is order-scoped", async () => {
+      // shipOrderId is a real, different order — extraTracking only exists
+      // as an order_tracking_numbers row under returnOrderId, so polling it
+      // against shipOrderId must miss entirely (proves the poll path's
+      // extra-parcel fallback is scoped to p_order_id, not a global scan
+      // like the webhook path's is).
+      const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+        p_order_id: shipOrderId,
+        p_actor_id: staffId,
+        p_tracking_number: extraTracking,
+        p_carrier_code: "royal_mailv2",
+        p_parent_status: "shipment-on-route",
+        p_status_description: "In transit",
+        p_event_at: new Date().toISOString(),
+      });
+      expect(error).toBeNull();
+      expect(data?.matched).toBe(false);
+      expect(data?.reason).toMatch(/stale poll result/);
+    });
+  });
+});

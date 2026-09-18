@@ -72,6 +72,37 @@
 // Both paths share the same per-tracking-number Sendcloud-calling logic
 // (pollOneTrackingNumber below) -- extracted specifically so this
 // duplication never has to happen, not as a preemptive abstraction.
+//
+// Extra-parcel polling (added 20260918, migration
+// 20260918133000_extend_tracking_poll_eligibility_for_extra_parcels.sql):
+// a genuine gap found while building multi-parcel tracking support -- this
+// function previously only ever polled an order's own primary
+// outbound_tracking_number/return_tracking_number, never anything in the
+// new order_tracking_numbers table (extra parcels added via
+// add_order_tracking_number, for orders that genuinely ship as more than
+// one box). Since Sendcloud webhooks have never once reached this system in
+// production, that would have left an extra parcel's status permanently
+// stuck at 'awaiting_scan' with no live path to ever update it. Both the
+// manual single-order path and the scheduled batch path now also fetch and
+// poll any non-delivered order_tracking_numbers rows for the order(s) in
+// scope, reusing the same pollOneTrackingNumber() helper -- which already
+// knew how to match and update an extra parcel via
+// apply_sendcloud_poll_result()'s own fallback branch, it just was never
+// being handed an extra parcel's tracking number to poll in the first
+// place. orders_needing_tracking_poll() was widened in the same spirit (an
+// order with only extra parcels and no primary tracking yet is now also
+// eligible) so the scheduled path's own order-selection query doesn't miss
+// that edge case either.
+//
+// NOT YET DEPLOYED as of 20260918: written and verified locally, but the
+// deploy_edge_function MCP tool errored on every attempt this session with
+// a ZodError on its own "files" parameter (even a trivial one-line test
+// payload reproduced the same error on two separate Supabase MCP server
+// instances) -- a harness-level bug, not a bad payload, and not something
+// fixable by retrying. The live function is still the pre-20260918 version
+// (verified unchanged via list_edge_functions). Deploy this file via the
+// Supabase CLI or dashboard, or retry the MCP deploy tool in a later
+// session once it's working again.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
@@ -201,7 +232,11 @@ async function triggerReturnInTransitEmail(orderId: string, estimatedArrivalDate
 // scheduled/batch (pg_cron, actor_id null) callers -- extracted so the
 // Sendcloud-calling and result-parsing logic exists exactly once. Never
 // throws -- every failure mode is folded into the returned result object,
-// same contract the original inline loop had.
+// same contract the original inline loop had. Also the shared path for
+// extra-parcel tracking numbers (order_tracking_numbers rows) -- it doesn't
+// need to know or care whether a given tracking number is the order's
+// primary parcel or an extra one; apply_sendcloud_poll_result() already
+// handles that distinction internally.
 async function pollOneTrackingNumber(
   orderId: string,
   actorId: string | null,
@@ -264,6 +299,24 @@ async function pollOneTrackingNumber(
     captureError(err, { function: "poll-sendcloud-tracking", trackingNumber, orderId });
     return { tracking_number: trackingNumber, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+// Fetches any non-delivered extra-parcel tracking numbers for a single
+// order (order_tracking_numbers rows) -- used by the manual single-order
+// path. A delivered extra parcel is excluded, same reasoning as the
+// primary-parcel path never re-polling a completed order: nothing left to
+// learn from asking again.
+async function fetchExtraTrackingNumbers(orderId: string): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("order_tracking_numbers")
+    .select("tracking_number")
+    .eq("order_id", orderId)
+    .neq("status", "delivered");
+  if (error) {
+    captureError(error, { function: "poll-sendcloud-tracking", step: "fetch extra parcels", orderId });
+    return [];
+  }
+  return (data ?? []).map((row) => row.tracking_number as string);
 }
 
 Deno.serve(async (req: Request) => {
@@ -329,9 +382,13 @@ async function handleRequest(req: Request): Promise<Response> {
     );
   }
 
-  const trackingNumbers = Array.from(
-    new Set([order.outbound_tracking_number, order.return_tracking_number].filter((tn): tn is string => !!tn))
+  const trackingNumberSet = new Set<string>(
+    [order.outbound_tracking_number, order.return_tracking_number].filter((tn): tn is string => !!tn)
   );
+  for (const tn of await fetchExtraTrackingNumbers(order_id)) {
+    trackingNumberSet.add(tn);
+  }
+  const trackingNumbers = Array.from(trackingNumberSet);
 
   if (trackingNumbers.length === 0) {
     return new Response(
@@ -371,12 +428,13 @@ interface EligibleOrder {
 // The scheduled/batch path: no order_id in the request, no human actor.
 // Called hourly by trigger_scheduled_tracking_poll() via pg_cron/pg_net.
 // Fetches every order orders_needing_tracking_poll() reports as eligible
-// (fulfilment_status in dispatched/in_transit, at least one tracking
-// number), polls each of that order's tracking numbers exactly once via
-// the same pollOneTrackingNumber() the manual path uses, with
-// actorId: null throughout -- apply_sendcloud_poll_result() treats a null
-// actor as system-triggered rather than raising the internal-staff check a
-// stale/placeholder actor_id would otherwise hit.
+// (fulfilment_status in dispatched/in_transit, at least one tracking number
+// -- primary or extra, as of the 20260918 widening), polls each of that
+// order's tracking numbers exactly once via the same pollOneTrackingNumber()
+// the manual path uses, with actorId: null throughout --
+// apply_sendcloud_poll_result() treats a null actor as system-triggered
+// rather than raising the internal-staff check a stale/placeholder actor_id
+// would otherwise hit.
 async function handleScheduledBatch(): Promise<Response> {
   const { data: eligibleOrders, error: eligibleError } = await supabase.rpc("orders_needing_tracking_poll");
   if (eligibleError) {
@@ -402,12 +460,35 @@ async function handleScheduledBatch(): Promise<Response> {
   }
   const basicAuth = btoa(`${creds.public_key}:${creds.secret_key}`);
 
+  // One query for every eligible order's extra (non-delivered) parcels,
+  // rather than N -- same batching discipline the rest of this scheduled
+  // path already follows.
+  const orderIds = orders.map((o) => o.order_id);
+  const { data: extraParcelRows, error: extraParcelsError } = await supabase
+    .from("order_tracking_numbers")
+    .select("order_id, tracking_number")
+    .in("order_id", orderIds)
+    .neq("status", "delivered");
+  if (extraParcelsError) {
+    captureError(extraParcelsError, { function: "poll-sendcloud-tracking", step: "fetch extra parcels (scheduled batch)" });
+  }
+  const extraByOrder = new Map<string, string[]>();
+  for (const row of extraParcelRows ?? []) {
+    const list = extraByOrder.get(row.order_id as string) ?? [];
+    list.push(row.tracking_number as string);
+    extraByOrder.set(row.order_id as string, list);
+  }
+
   const results: { order_id: string; reference: string; tracking_results: Record<string, unknown>[] }[] = [];
 
   for (const order of orders) {
-    const trackingNumbers = Array.from(
-      new Set([order.outbound_tracking_number, order.return_tracking_number].filter((tn): tn is string => !!tn))
+    const trackingNumberSet = new Set<string>(
+      [order.outbound_tracking_number, order.return_tracking_number].filter((tn): tn is string => !!tn)
     );
+    for (const tn of extraByOrder.get(order.order_id) ?? []) {
+      trackingNumberSet.add(tn);
+    }
+    const trackingNumbers = Array.from(trackingNumberSet);
     const trackingResults: Record<string, unknown>[] = [];
     for (const trackingNumber of trackingNumbers) {
       trackingResults.push(await pollOneTrackingNumber(order.order_id, null, trackingNumber, basicAuth));
