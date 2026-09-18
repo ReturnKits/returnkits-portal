@@ -155,6 +155,14 @@ const FROM_ADDRESS = "ReturnKits <noreply@mail.returnkits.com>";
 // a message that just repeats every few days.
 const PORTAL_URL = "https://portal.returnkits.com";
 
+// ReturnKits' own internal inbox for a plain copy of every order
+// confirmation (added 20260918, direct user request: "i need an order
+// confirmation to me with the details orders@returnkits.com"). Same
+// hardcoded-constant convention as FROM_ADDRESS/PORTAL_URL above rather
+// than a settings-table row -- this is ReturnKits' own address, not
+// anything customer-configurable.
+const ORDERS_NOTIFICATION_EMAIL = "orders@returnkits.com";
+
 if (!supabaseUrl || !serviceRoleKey || !resendApiKey) {
   console.error("send-order-email: missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / RESEND_API_KEY");
 }
@@ -539,6 +547,87 @@ function buildOrderConfirmationEmail(props: {
   return layout(`Order confirmed — ${primaryRef}${moreCount > 0 ? ` (+${moreCount} more)` : ""}`, body);
 }
 
+// ---- Internal order confirmation copy (added 20260918) ------------------
+//
+// A plain summary sent to ReturnKits' own inbox (ORDERS_NOTIFICATION_EMAIL)
+// every time a customer's order_confirmation goes out, so staff have their
+// own visibility into new orders without checking the portal or Retool.
+// Reuses the exact same bundle-aware data the customer copy is built from
+// (lines/bundleReference/returnAddress) rather than re-querying anything --
+// this is a second render of the same order, not a new lookup.
+//
+// Deliberately keeps pricing and reference numbers -- this codebase's own
+// "employee never sees pricing" rule (see the employee-facing templates
+// above) exists to keep that data away from the leaver/new-starter, not
+// from ReturnKits' own staff, who are exactly who this copy is for.
+function buildInternalOrderConfirmationEmail(props: {
+  companyName: string;
+  placedByEmail: string;
+  createdAt: string;
+  lines: ConfirmationLine[];
+  bundleReference: string | null;
+  returnAddress: ReturnAddress | null;
+}): string {
+  const totalExVat = props.lines.reduce((sum, l) => sum + l.priceExVatPence, 0);
+
+  const refs = props.lines.map((l) => l.reference);
+  const primaryRef = refs[0] ?? "";
+  const moreCount = refs.length - 1;
+  const uniqueKitLabels = [...new Set(props.lines.map((l) => l.kitLabel))].join(", ");
+
+  const lineItems = props.lines
+    .map(
+      (line) => `<tr>
+        <td style="padding:8px 0;font-size:14px;color:#111827;border-bottom:1px solid #f3f4f6;">${escapeHtml(line.kitLabel)} <span style="color:#9ca3af;">(${escapeHtml(line.reference)})</span></td>
+        <td style="padding:8px 0;font-size:14px;color:#111827;text-align:right;vertical-align:top;border-bottom:1px solid #f3f4f6;">${pence(line.priceExVatPence)}</td>
+      </tr>`,
+    )
+    .join("");
+
+  const returnAddressLine = props.returnAddress
+    ? formatAddressLine(props.returnAddress.address_line1, props.returnAddress.address_line2, props.returnAddress.city, props.returnAddress.postcode)
+    : "";
+  const returnBlock = props.returnAddress
+    ? destinationBlock("Return destination", props.returnAddress.label ?? props.companyName, returnAddressLine)
+    : "";
+
+  // Same per-recipient dedupe as the customer copy's own shipping blocks --
+  // one block per distinct new-starter address, not one per line item.
+  const seenEmployees = new Set<string>();
+  const shippingBlocks = props.lines
+    .filter((l) => l.serviceType !== "return" && l.employeeName)
+    .filter((l) => {
+      const key = `${l.employeeName}|${l.employeeAddress}`;
+      if (seenEmployees.has(key)) return false;
+      seenEmployees.add(key);
+      return true;
+    })
+    .map((l) => destinationBlock("Shipping to", l.employeeName as string, l.employeeAddress ?? ""))
+    .join("");
+
+  const body = `
+    <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(primaryRef)}${moreCount > 0 ? ` (+${moreCount} more)` : ""} · ${formatDate(props.createdAt)}</p>
+    <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">New order placed</h1>
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">${escapeHtml(props.companyName)} has placed a new order in the portal.</p>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;margin:0 0 20px;">
+      ${metaRow("Company", props.companyName)}
+      ${metaRow("Placed by", props.placedByEmail)}
+      ${metaRow("Order ID", refs.join(", "))}
+      ${props.bundleReference ? metaRow("Bundle", props.bundleReference) : ""}
+      ${metaRow("Order date", formatDate(props.createdAt))}
+      ${metaRow("Kit types", uniqueKitLabels)}
+    </table>
+    <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;">
+      ${lineItems}
+      <tr><td style="padding:10px 0 0;font-size:15px;color:#111827;font-weight:700;">Total paid</td><td style="padding:10px 0 0;font-size:15px;color:#111827;font-weight:700;text-align:right;">${pence(totalExVat)}</td></tr>
+    </table>
+    ${returnBlock}
+    ${shippingBlocks}
+  `;
+
+  return layout(`New order — ${props.companyName} — ${primaryRef}${moreCount > 0 ? ` (+${moreCount} more)` : ""}`, body);
+}
+
 // ---- Dispatched ---------------------------------------------------------
 
 // Table-cell-with-bgcolor button, not a styled <a> -- Outlook's Word engine
@@ -654,7 +743,7 @@ function buildDispatchedEmail(props: {
       nextStepsBlock = `
         <h2 style="font-size:14px;font-weight:700;color:#111827;margin:24px 0 12px;">What happens next</h2>
         <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 4px;">${methodLine}</p>
-        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:12px 0 0;">We've sent ${employeeDisplay} the full instructions directly — nothing further needed from you. We'll let you know once it's back with us.</p>
+        <p style="font-size:13px;line-height:20px;color:#6b7280;margin:12px 0 0;">We've sent ${employeeDisplay} the full instructions directly — nothing further needed from you.</p>
       `;
     } else {
       nextStepsBlock = `
@@ -1305,6 +1394,102 @@ async function sendEmployeeCopy(props: {
   }
 }
 
+// Fires once per order_confirmation send (bundle-aware, same dedupe scope
+// as the customer copy -- whichever order in a bundle triggers first wins)
+// to ReturnKits' own inbox. Sits alongside sendEmployeeCopy() as a second
+// "extra recipient" helper but is simpler: no per-company opt-in, and no
+// suppression-list check -- ORDERS_NOTIFICATION_EMAIL is ReturnKits' own
+// inbox, not a customer/employee address that can bounce into the
+// suppression list.
+//
+// Called from handleRequest's order_confirmation branch before the
+// customer's own suppression check, so a suppressed/bounced customer
+// address never blocks staff's own copy. It IS still gated by the earlier
+// notification_enabled(company_id, 'order_confirmation') check at the top
+// of handleRequest, since that check returns before any of this order's
+// data is even loaded -- if a company has muted their own order
+// confirmations, staff's internal copy is skipped along with it. Accepted
+// as a known, narrow edge case rather than threading a bypass through that
+// earlier gate for one rarely-used combination.
+async function sendInternalOrderConfirmationCopy(props: {
+  orderIds: string[];
+  primaryOrderId: string;
+  companyId: string;
+  companyName: string;
+  placedByEmail: string;
+  createdAt: string;
+  lines: ConfirmationLine[];
+  bundleReference: string | null;
+  returnAddress: ReturnAddress | null;
+}): Promise<void> {
+  const { data: existing } = await supabase
+    .from("communication_log")
+    .select("id")
+    .eq("type", "order_confirmation")
+    .eq("audience", "internal")
+    .in("order_id", props.orderIds)
+    .in("status", ["sent", "delivered"])
+    .limit(1);
+  if (existing && existing.length > 0) return;
+
+  const refs = props.lines.map((l) => l.reference);
+  const subject =
+    refs.length > 1
+      ? `New order — ${props.companyName} — ${refs[0]} (+${refs.length - 1} more)`
+      : `New order — ${props.companyName} — ${refs[0]}`;
+
+  const html = buildInternalOrderConfirmationEmail({
+    companyName: props.companyName,
+    placedByEmail: props.placedByEmail,
+    createdAt: props.createdAt,
+    lines: props.lines,
+    bundleReference: props.bundleReference,
+    returnAddress: props.returnAddress,
+  });
+
+  try {
+    const resendResp = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${resendApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ from: FROM_ADDRESS, to: ORDERS_NOTIFICATION_EMAIL, subject, html }),
+    });
+    const resendBody = await resendResp.json().catch(() => ({}));
+
+    await supabase.from("communication_log").insert({
+      order_id: props.primaryOrderId,
+      company_id: props.companyId,
+      channel: "email",
+      type: "order_confirmation",
+      audience: "internal",
+      recipient: ORDERS_NOTIFICATION_EMAIL,
+      subject,
+      status: resendResp.ok ? "sent" : "failed",
+      provider_message_id: resendResp.ok ? (resendBody.id ?? null) : null,
+      error_message: resendResp.ok ? null : JSON.stringify(resendBody).slice(0, 1000),
+    });
+
+    if (!resendResp.ok) {
+      captureError(new Error(`Resend send failed (internal order confirmation copy): ${JSON.stringify(resendBody).slice(0, 500)}`), {
+        function: "send-order-email",
+        orderId: props.primaryOrderId,
+        type: "order_confirmation",
+        audience: "internal",
+      });
+    }
+  } catch (err) {
+    captureError(err, {
+      function: "send-order-email",
+      orderId: props.primaryOrderId,
+      type: "order_confirmation",
+      audience: "internal",
+      step: "internal order confirmation copy",
+    });
+  }
+}
+
 // ---- Handler --------------------------------------------------------------
 
 Deno.serve(async (req: Request) => {
@@ -1651,6 +1836,25 @@ async function handleRequest(req: Request): Promise<Response> {
       trackingNumber: o.return_tracking_number ?? "—",
       trackingUrl: o.return_tracking_url,
       estimatedArrivalDate,
+    });
+  }
+
+  // Internal staff copy (added 20260918, direct user request: "i need an
+  // order confirmation to me with the details orders@returnkits.com") --
+  // fires before the customer's own suppression check, so it's independent
+  // of whether the customer's own copy is suppressed or later fails to
+  // send via Resend.
+  if (type === "order_confirmation") {
+    await sendInternalOrderConfirmationCopy({
+      orderIds: siblingOrderIds,
+      primaryOrderId: o.id,
+      companyId: o.company.id,
+      companyName: o.company.name,
+      placedByEmail: recipientEmail,
+      createdAt: o.created_at,
+      lines: confirmationLines,
+      bundleReference,
+      returnAddress,
     });
   }
 

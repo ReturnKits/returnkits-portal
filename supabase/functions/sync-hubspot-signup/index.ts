@@ -40,6 +40,23 @@
 //     Company records. Handled below: on that specific error, fall back to
 //     a plain POST /crm/v3/objects/companies create instead of failing the
 //     whole sync.
+//
+//   FIX 20260918 (Sentry RETURNKITS-PORTAL-4, a genuine live signup --
+//   "AutoConverse", autoconverse.co.uk): the real HubSpot error text is
+//   "Unable to perform update/upsert by non-unique 0-2 property domain in
+//   portal ID ..." -- HubSpot inlines its own object-type code ("0-2" =
+//   Companies) between "non-unique" and "property", so the original exact
+//   substring check ("non-unique property") never matched and this always
+//   fell through to reporting a hard failure instead of the plain-create
+//   fallback. (The signup still ended up fully correct in HubSpot that one
+//   time -- this portal has "auto-create/associate company from contact
+//   email domain" enabled, so HubSpot's own automation created and linked
+//   the Company independently of this function's own attempt. That's a
+//   lucky coincidence specific to this portal's settings, not something to
+//   rely on -- a portal without that setting, or a genuinely offline
+//   HubSpot call, would have left the signup with a Contact and no Company
+//   at all.) Fixed by matching on the message field alone with a
+//   whitespace-tolerant pattern instead of a brittle exact phrase.
 //   - Association: PUT /crm/v4/objects/company/{companyId}/associations/
 //     default/contact/{contactId} is the v4 "default association" endpoint
 //     for the standard unlabeled Company<->Contact link.
@@ -194,6 +211,7 @@ async function syncToHubspot(company: CompanyRow, admin: AdminUserRow): Promise<
   // create if the portal has a non-unique domain collision (a real,
   // documented HubSpot failure mode, not hypothetical).
   let companyId: string | undefined;
+  let nonUniqueDomainFallback = false;
   if (company.domain) {
     const companyUpsertResp = await hubspotFetch(accessToken, "/crm/v3/objects/companies/batch/upsert", {
       method: "POST",
@@ -213,12 +231,43 @@ async function syncToHubspot(company: CompanyRow, admin: AdminUserRow): Promise<
       companyId = companyUpsertBody?.results?.[0]?.id;
     } else {
       const bodyText = JSON.stringify(companyUpsertBody);
-      const isNonUniqueDomain = bodyText.includes("non-unique property") || bodyText.includes("non-unique property domain");
+      // Whitespace/token-tolerant: HubSpot's real message inlines its own
+      // object-type code between "non-unique" and "property" (observed:
+      // "non-unique 0-2 property domain"), so an exact-phrase match is too
+      // brittle -- match on "non-unique" and "domain" both being present
+      // in the message instead of one fixed phrase.
+      const message: string = typeof companyUpsertBody?.message === "string" ? companyUpsertBody.message : bodyText;
+      const isNonUniqueDomain = /non-unique/i.test(message) && /domain/i.test(message);
       if (!isNonUniqueDomain) {
         return { ok: false, error: `Company upsert failed (${companyUpsertResp.status}): ${bodyText.slice(0, 500)}` };
       }
-      // Fall through to plain create below.
+      // Fall through below: first try to find an existing match by domain
+      // (see the search step next), then plain-create only as a last resort.
+      nonUniqueDomainFallback = true;
     }
+  }
+
+  // A "non-unique domain" error means the portal already has more than one
+  // Company record sharing this domain -- a blind POST create would only
+  // add a third. Search for an existing match first (oldest wins, treated
+  // as the canonical record) and reuse it rather than piling on a
+  // duplicate; only create a brand new Company if no match turns up.
+  if (!companyId && nonUniqueDomainFallback && company.domain) {
+    const searchResp = await hubspotFetch(accessToken, "/crm/v3/objects/companies/search", {
+      method: "POST",
+      body: JSON.stringify({
+        filterGroups: [{ filters: [{ propertyName: "domain", operator: "EQ", value: company.domain }] }],
+        sorts: [{ propertyName: "createdate", direction: "ASCENDING" }],
+        properties: ["name", "domain"],
+        limit: 1,
+      }),
+    });
+    const searchBody = await searchResp.json().catch(() => ({}));
+    if (searchResp.ok && Array.isArray(searchBody?.results) && searchBody.results.length > 0) {
+      companyId = searchBody.results[0]?.id;
+    }
+    // A non-2xx or empty-results search is not fatal -- fall through to
+    // plain create below exactly as before this fix.
   }
 
   if (!companyId) {
