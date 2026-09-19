@@ -2204,6 +2204,249 @@ describe("apply_sendcloud_tracking_event() / apply_sendcloud_poll_result() — o
   });
 });
 
+describe("apply_sendcloud_tracking_event() / apply_sendcloud_poll_result() — 'return_in_transit' for the return leg's own first scan (added 20260919)", () => {
+  // Direct follow-on from the 'delivered' fix above: a return order sitting
+  // at 'delivered' ("with employee") had no further transition at all once
+  // the return leg itself was scanned in transit -- the generic 'in_transit'
+  // branch only fires from fulfilment_status = 'dispatched', which a
+  // return-leg scan essentially never satisfies once the outbound leg has
+  // already advanced the order past 'dispatched'. New dedicated status
+  // 'return_in_transit', reached only via delivered -> return leg in_transit.
+  // Deliberately NOT reusing 'in_transit' -- that would make the customer
+  // step tracker jump backwards ("With employee" -> "On its way").
+  let company: { id: string };
+  const custEmail = uniqueEmail("rit-cust");
+  const staffEmail = uniqueEmail("rit-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let addressId: string;
+  let webhookOrderId: string;
+  let pollOrderId: string;
+  let checkinOrderId: string;
+  const webhookReturn = `RIT-WH-RET-${Date.now()}`;
+  const pollReturn = `RIT-POLL-RET-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Return In Transit Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "RIT Test", email: "rit@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 RIT St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+    addressId = (addr as { id: string }).id;
+
+    const client = await clientAsUser(custEmail);
+    const makeReturnOrder = async () => {
+      const { data, error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "return",
+        p_employee_id: employee.id,
+        p_return_address_id: addressId,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+
+    webhookOrderId = await makeReturnOrder();
+    pollOrderId = await makeReturnOrder();
+    checkinOrderId = await makeReturnOrder();
+
+    // All three start at the 'delivered' intermediate -- outbound leg
+    // already reached the employee -- which is the only pre-state this new
+    // transition fires from.
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "delivered", return_tracking_number: webhookReturn })
+      .eq("id", webhookOrderId);
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "delivered", return_tracking_number: pollReturn })
+      .eq("id", pollOrderId);
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "delivered",
+        fulfilment_log: [{ at: "2026-08-01T09:00:00+00:00", action: "dispatched", detail: {}, actor_id: staffId }],
+      })
+      .eq("id", checkinOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✓ webhook: return leg's first in-transit scan moves 'delivered' -> 'return_in_transit'", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookReturn,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "en_route",
+      p_status_description: "On its way.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("return_in_transit");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", webhookOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("return_in_transit");
+    const log = order?.fulfilment_log as Array<{ action: string }>;
+    expect(log.some((entry) => entry.action === "return_in_transit")).toBe(true);
+  });
+
+  it("✓ webhook: replaying the same event is a safe no-op (still 'return_in_transit')", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookReturn,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "en_route",
+      p_status_description: "On its way.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(false);
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", webhookOrderId).single();
+    expect(order?.fulfilment_status).toBe("return_in_transit");
+  });
+
+  it("✓ webhook: return leg delivered from 'return_in_transit' completes the order", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookReturn,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", webhookOrderId).single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+
+  it("✓ poll: return leg's first in-transit scan moves 'delivered' -> 'return_in_transit' (scheduled/null actor)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: pollOrderId,
+      p_actor_id: null,
+      p_tracking_number: pollReturn,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "shipment-on-route",
+      p_status_description: "On its way",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("return_in_transit");
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", pollOrderId).single();
+    expect(order?.fulfilment_status).toBe("return_in_transit");
+  });
+
+  it("✓ poll: return leg delivered from 'return_in_transit' completes the order, actor-attributed", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: pollOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: pollReturn,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", pollOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    const log = order?.fulfilment_log as Array<{ action: string; actor_id: string | null }>;
+    const completedEntry = log.find((entry) => entry.action === "completed");
+    expect(completedEntry?.actor_id).toBe(staffId);
+  });
+
+  it("✓ orders_needing_tracking_poll() includes an order sitting at 'return_in_transit' (keeps polling for the final delivered scan)", async () => {
+    const { data, error } = await adminClient.rpc("orders_needing_tracking_poll");
+    expect(error).toBeNull();
+    const ids = (data as Array<{ order_id: string }>).map((r) => r.order_id);
+    expect(ids).toContain(checkinOrderId);
+
+    // Move it to return_in_transit and confirm it's still eligible.
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "return_in_transit", return_tracking_number: `RIT-POLL-ELIG-${Date.now()}` })
+      .eq("id", checkinOrderId);
+    const { data: data2, error: error2 } = await adminClient.rpc("orders_needing_tracking_poll");
+    expect(error2).toBeNull();
+    const ids2 = (data2 as Array<{ order_id: string }>).map((r) => r.order_id);
+    expect(ids2).toContain(checkinOrderId);
+  });
+
+  it("✓ orders_needing_checkin() deliberately EXCLUDES an order sitting at 'return_in_transit' (reminders stop once the return is confirmed moving)", async () => {
+    // checkinOrderId's own SLA is already clear (dispatched 2026-08-01, well
+    // past the 5-working-day window) and it was at 'delivered' -- eligible --
+    // until the previous test moved it to 'return_in_transit'. That's the
+    // exact scenario this test protects: once the return leg is confirmed
+    // en route, the "please send it back" nudge no longer makes sense and
+    // must stop firing, by construction (this status is simply not in
+    // orders_needing_checkin()'s own eligibility list).
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status")
+      .eq("id", checkinOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("return_in_transit");
+
+    const { data, error } = await adminClient.rpc("orders_needing_checkin");
+    expect(error).toBeNull();
+    const ids = (data as Array<{ order_id: string }>).map((r) => r.order_id);
+    expect(ids).not.toContain(checkinOrderId);
+  });
+
+  it("✓ mark_return_completed() accepts the 'return_in_transit' precondition (staff can still manually close out)", async () => {
+    const { error } = await adminClient.rpc("mark_return_completed", {
+      p_order_id: checkinOrderId,
+      p_actor_id: staffId,
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status")
+      .eq("id", checkinOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+});
+
 describe("apply_sendcloud_poll_result() — 'Check Tracking Now' pull fallback (20260813)", () => {
   // The poll-path counterpart to apply_sendcloud_tracking_event(), added
   // after live-testing found sendcloud_webhook_events sits at zero rows --
