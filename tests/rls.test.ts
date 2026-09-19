@@ -1889,6 +1889,321 @@ describe("apply_sendcloud_tracking_event() / delivered -> completed (20260813)",
   });
 });
 
+describe("apply_sendcloud_tracking_event() / apply_sendcloud_poll_result() — outbound leg 'delivered' on a return order must NOT auto-complete (fix, 20260919)", () => {
+  // Bug found via a direct user report: in Retool, a return order's
+  // fulfilment_status jumped to 'completed' the moment the OUTBOUND leg (kit
+  // going TO the employee) got a Sendcloud 'delivered' scan -- identical to
+  // how a ship_to_new_employee order completes off its single leg. Wrong:
+  // the device hasn't come back yet. Root cause: both functions' 'delivered'
+  // branch ignored v_leg entirely for any order that wasn't
+  // ship_to_new_employee.
+  //
+  // Fixed by splitting the 'delivered' branch on v_leg for non-
+  // ship_to_new_employee (i.e. return) orders: outbound leg delivered now
+  // moves the order to the existing-but-previously-unused 'delivered' CHECK
+  // value ("with the employee, return still pending"), never 'completed'.
+  // Only the return leg's own delivered event completes the order, and it
+  // does so from any of dispatched/in_transit/delivered -- the return leg
+  // doesn't have to wait for the outbound leg to have reached 'delivered'
+  // first.
+  //
+  // ship_to_new_employee behaviour is completely unchanged (still jumps
+  // straight from dispatched/in_transit to completed off its own outbound
+  // scan, still stamps confirmed_received_at) and is already exhaustively
+  // covered by the "delivered -> completed (20260813)" describe block above,
+  // which passes unmodified under this fix since its fixtures only ever
+  // exercise the ship_to_new_employee branch, which this change does not
+  // touch.
+  let company: { id: string };
+  const custEmail = uniqueEmail("leg-fix-cust");
+  const staffEmail = uniqueEmail("leg-fix-staff");
+  let staffId: string;
+  let employee: { id: string };
+  let addressId: string;
+  let webhookOrderId: string;
+  let pollOrderId: string;
+  let returnFirstOrderId: string; // return leg delivered before outbound ever was
+  const webhookOutbound = `LEGFIX-WH-OUT-${Date.now()}`;
+  const webhookReturn = `LEGFIX-WH-RET-${Date.now()}`;
+  const pollOutbound = `LEGFIX-POLL-OUT-${Date.now()}`;
+  const pollReturn = `LEGFIX-POLL-RET-${Date.now()}`;
+  const returnFirstReturn = `LEGFIX-RF-RET-${Date.now()}`;
+
+  beforeAll(async () => {
+    company = await createCompany("Leg Fix Test Co");
+    const staff = await createAuthUser(staffEmail);
+    staffId = staff.id;
+    await createProfile(staff.id, null, staffEmail, "internal_ops");
+
+    const cust = await createAuthUser(custEmail);
+    await createProfile(cust.id, company.id, custEmail, "company_admin");
+
+    const { data: emp, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "Leg Fix Test", email: "legfix@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+    employee = emp as { id: string };
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Leg Fix St", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+    addressId = (addr as { id: string }).id;
+
+    const client = await clientAsUser(custEmail);
+
+    const makeReturnOrder = async () => {
+      const { data, error } = await client.rpc("create_order", {
+        p_kit_type_id: "laptop",
+        p_service_type: "return",
+        p_employee_id: employee.id,
+        p_return_address_id: addressId,
+      });
+      if (error) throw error;
+      return data as string;
+    };
+
+    webhookOrderId = await makeReturnOrder();
+    pollOrderId = await makeReturnOrder();
+    returnFirstOrderId = await makeReturnOrder();
+
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "in_transit",
+        outbound_tracking_number: webhookOutbound,
+        return_tracking_number: webhookReturn,
+      })
+      .eq("id", webhookOrderId);
+
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "in_transit",
+        outbound_tracking_number: pollOutbound,
+        return_tracking_number: pollReturn,
+      })
+      .eq("id", pollOrderId);
+
+    // Still 'dispatched', outbound never scanned delivered at all -- proves
+    // the return leg's own completion doesn't depend on the order having
+    // passed through the new 'delivered' intermediate first.
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "dispatched", return_tracking_number: returnFirstReturn })
+      .eq("id", returnFirstOrderId);
+  });
+
+  afterAll(async () => {
+    await adminClient.from("orders").delete().eq("company_id", company.id);
+    for (const email of [custEmail, staffEmail]) {
+      await deleteAuthUserByEmail(email);
+    }
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✓ webhook: outbound leg delivered moves a return order to 'delivered', NOT 'completed'", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookOutbound,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("outbound");
+    expect(data?.new_status).toBe("delivered");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at, fulfilment_log")
+      .eq("id", webhookOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("delivered");
+    expect(order?.confirmed_received_at).toBeNull(); // never stamped on a return order
+    const log = order?.fulfilment_log as Array<{ action: string }>;
+    expect(log.some((entry) => entry.action === "delivered")).toBe(true);
+  });
+
+  it("✓ webhook: replaying the same outbound-delivered event is a safe no-op (still 'delivered', not re-applied)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookOutbound,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(false);
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", webhookOrderId).single();
+    expect(order?.fulfilment_status).toBe("delivered");
+  });
+
+  it("✓ webhook: return leg delivered on the same order (now sitting at 'delivered') completes it", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: webhookReturn,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, confirmed_received_at")
+      .eq("id", webhookOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    expect(order?.confirmed_received_at).toBeNull();
+  });
+
+  it("✓ webhook: the return leg completes the order even when the outbound leg was never scanned delivered at all", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_tracking_event", {
+      p_tracking_number: returnFirstReturn,
+      p_carrier_code: "royal_mailv2",
+      p_status_code: "delivered",
+      p_status_description: "Parcel has been delivered.",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", returnFirstOrderId).single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+
+  it("✓ poll: outbound leg delivered moves a return order to 'delivered', NOT 'completed' (scheduled/null actor)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: pollOrderId,
+      p_actor_id: null,
+      p_tracking_number: pollOutbound,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("outbound");
+    expect(data?.new_status).toBe("delivered");
+
+    const { data: order } = await adminClient.from("orders").select("fulfilment_status").eq("id", pollOrderId).single();
+    expect(order?.fulfilment_status).toBe("delivered");
+  });
+
+  it("✓ poll: return leg delivered on the same order completes it, actor-attributed (staff-triggered poll)", async () => {
+    const { data, error } = await adminClient.rpc("apply_sendcloud_poll_result", {
+      p_order_id: pollOrderId,
+      p_actor_id: staffId,
+      p_tracking_number: pollReturn,
+      p_carrier_code: "royal_mailv2",
+      p_parent_status: "delivered",
+      p_status_description: "Delivered",
+      p_event_at: new Date().toISOString(),
+    });
+    expect(error).toBeNull();
+    expect(data?.applied).toBe(true);
+    expect(data?.leg).toBe("return");
+    expect(data?.new_status).toBe("completed");
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status, fulfilment_log")
+      .eq("id", pollOrderId)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+    const log = order?.fulfilment_log as Array<{ action: string; actor_id: string | null }>;
+    const completedEntry = log.find((entry) => entry.action === "completed");
+    expect(completedEntry?.actor_id).toBe(staffId);
+  });
+
+  it("✓ orders_needing_tracking_poll() includes an order sitting at the new 'delivered' intermediate", async () => {
+    const client = await clientAsUser(custEmail);
+    const { data: freshId, error: freshError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: addressId,
+    });
+    if (freshError) throw freshError;
+    await adminClient
+      .from("orders")
+      .update({ fulfilment_status: "delivered", outbound_tracking_number: `LEGFIX-FRESH-${Date.now()}` })
+      .eq("id", freshId as string);
+
+    const { data, error } = await adminClient.rpc("orders_needing_tracking_poll");
+    expect(error).toBeNull();
+    const ids = (data as Array<{ order_id: string }>).map((r) => r.order_id);
+    expect(ids).toContain(freshId as string);
+
+    await adminClient.from("orders").delete().eq("id", freshId as string);
+  });
+
+  it("✓ orders_needing_checkin() includes a return order sitting at 'delivered' once its own SLA clears", async () => {
+    const client = await clientAsUser(custEmail);
+    const { data: freshId, error: freshError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: addressId,
+      p_return_method: "drop_off",
+    });
+    if (freshError) throw freshError;
+
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "delivered",
+        fulfilment_log: [{ at: "2026-08-01T09:00:00+00:00", action: "dispatched", detail: {}, actor_id: staffId }],
+      })
+      .eq("id", freshId as string);
+
+    const { data, error } = await adminClient.rpc("orders_needing_checkin");
+    expect(error).toBeNull();
+    const ids = (data as Array<{ order_id: string }>).map((r) => r.order_id);
+    expect(ids).toContain(freshId as string);
+
+    await adminClient.from("orders").delete().eq("id", freshId as string);
+  });
+
+  it("✓ mark_return_completed() accepts the 'delivered' precondition (staff can still manually close out)", async () => {
+    const client = await clientAsUser(custEmail);
+    const { data: freshId, error: freshError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee.id,
+      p_return_address_id: addressId,
+    });
+    if (freshError) throw freshError;
+    await adminClient.from("orders").update({ fulfilment_status: "delivered" }).eq("id", freshId as string);
+
+    const { error } = await adminClient.rpc("mark_return_completed", {
+      p_order_id: freshId as string,
+      p_actor_id: staffId,
+    });
+    expect(error).toBeNull();
+
+    const { data: order } = await adminClient
+      .from("orders")
+      .select("fulfilment_status")
+      .eq("id", freshId as string)
+      .single();
+    expect(order?.fulfilment_status).toBe("completed");
+  });
+});
+
 describe("apply_sendcloud_poll_result() — 'Check Tracking Now' pull fallback (20260813)", () => {
   // The poll-path counterpart to apply_sendcloud_tracking_event(), added
   // after live-testing found sendcloud_webhook_events sits at zero rows --
