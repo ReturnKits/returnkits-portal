@@ -4553,7 +4553,7 @@ describe("Security: internal_function_grant_leaks rebuilt as a dynamic, self-mai
 describe("Enhanced Cover — cover_tiers, order snapshotting, and flag_cover_claim (20260812)", () => {
   // Built after the fact: the architecture doc (§20) fully designed Enhanced
   // Cover, but nothing was ever wired up -- no table, no UI, nothing live --
-  // until enterprise pricing was quoted to a real prospect assuming it
+  // until volume discounts was quoted to a real prospect assuming it
   // existed. See CLAUDE.md's Enhanced Cover locked decision.
   let company: { id: string };
   const ownerEmail = uniqueEmail("cover-owner");
@@ -5231,7 +5231,7 @@ describe("Prepaid credits — credit_ledger RLS, redemption, purchase, and resto
   });
 });
 
-describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanced Cover redemption (20260819)", () => {
+describe("Volume discounts — tiered Laptop credit pricing and bundled Enhanced Cover redemption (20260819)", () => {
   // Scope confirmed with the user: Laptop only, tier decided per-purchase
   // (not cumulative lifetime volume), toggled self-serve by company_admin
   // from Settings. Every tier bundles the £2,000 Enhanced Cover tier into
@@ -5246,7 +5246,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
   //
   // Deliberately its own describe block with fresh fixtures rather than
   // extending the "Prepaid credits" block above -- flipping
-  // enterprise_pricing_enabled on a shared companyA would risk leaking into
+  // volume_discounts_enabled on a shared companyA would risk leaking into
   // that block's other assertions about flat-rate pricing.
   let companyA: { id: string };
   let companyB: { id: string };
@@ -5258,8 +5258,8 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
   let employeeA: { id: string };
 
   beforeAll(async () => {
-    companyA = await createCompany("Enterprise Pricing Test Co A");
-    companyB = await createCompany("Enterprise Pricing Test Co B");
+    companyA = await createCompany("Volume Discounts Test Co A");
+    companyB = await createCompany("Volume Discounts Test Co B");
 
     const admin = await createAuthUser(adminEmail);
     const member = await createAuthUser(memberEmail);
@@ -5274,7 +5274,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
 
     const { data: emp, error: empError } = await adminClient
       .from("employees")
-      .insert({ company_id: companyA.id, full_name: "Enterprise Test Employee", email: "ent-emp@example.com" })
+      .insert({ company_id: companyA.id, full_name: "Volume Discount Test Employee", email: "ent-emp@example.com" })
       .select()
       .single();
     if (empError) throw empError;
@@ -5300,10 +5300,10 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
     return (data ?? []).reduce((sum, row) => sum + (row.direction === "credit" ? row.quantity : -row.quantity), 0);
   }
 
-  describe("Schema: enterprise_pricing_tiers", () => {
+  describe("Schema: volume_discount_tiers", () => {
     it("✓ seeded with the four Laptop breakpoints, all bundling the £2,000 cover tier", async () => {
       const { data, error } = await adminClient
-        .from("enterprise_pricing_tiers")
+        .from("volume_discount_tiers")
         .select("min_quantity, price_ex_vat_pence, includes_cover_tier_id, active")
         .eq("kit_type_id", "laptop")
         .order("min_quantity", { ascending: true });
@@ -5318,15 +5318,15 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
 
     it("✓ world-readable: a signed-in company user can read the tier table", async () => {
       const client = await clientAsUser(memberEmail);
-      const { data, error } = await client.from("enterprise_pricing_tiers").select("id").eq("kit_type_id", "laptop");
+      const { data, error } = await client.from("volume_discount_tiers").select("id").eq("kit_type_id", "laptop");
       expect(error).toBeNull();
       expect(data?.length).toBe(4);
     });
 
-    it("✗ authenticated clients cannot write enterprise_pricing_tiers (same world-readable-but-read-only shape as kit_types/cover_tiers)", async () => {
+    it("✗ authenticated clients cannot write volume_discount_tiers (same world-readable-but-read-only shape as kit_types/cover_tiers)", async () => {
       const client = await clientAsUser(adminEmail);
       const { error, count } = await client
-        .from("enterprise_pricing_tiers")
+        .from("volume_discount_tiers")
         .update({ price_ex_vat_pence: 1 }, { count: "exact" })
         .eq("kit_type_id", "laptop")
         .eq("min_quantity", 1)
@@ -5335,7 +5335,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
       expect(count).toBe(0);
 
       const { data: unchanged } = await adminClient
-        .from("enterprise_pricing_tiers")
+        .from("volume_discount_tiers")
         .select("price_ex_vat_pence")
         .eq("kit_type_id", "laptop")
         .eq("min_quantity", 1)
@@ -5346,7 +5346,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
     it("✓ per-purchase tier lookup (highest qualifying min_quantity wins) matches every documented breakpoint", async () => {
       async function tierPriceFor(quantity: number): Promise<number | null> {
         const { data, error } = await adminClient
-          .from("enterprise_pricing_tiers")
+          .from("volume_discount_tiers")
           .select("price_ex_vat_pence")
           .eq("kit_type_id", "laptop")
           .eq("active", true)
@@ -5368,36 +5368,36 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
     });
   });
 
-  describe("RLS: companies.enterprise_pricing_enabled — self-serve, admin-only toggle", () => {
+  describe("RLS: companies.volume_discounts_enabled — self-serve, admin-only toggle", () => {
     it("✓ defaults to false for a newly created company", async () => {
       const { data } = await adminClient
         .from("companies")
-        .select("enterprise_pricing_enabled")
+        .select("volume_discounts_enabled")
         .eq("id", companyA.id)
         .single();
-      expect(data?.enterprise_pricing_enabled).toBe(false);
+      expect(data?.volume_discounts_enabled).toBe(false);
     });
 
-    it("✓ company_admin can turn Enterprise pricing on for their own company", async () => {
+    it("✓ company_admin can turn Volume discounts on for their own company", async () => {
       const client = await clientAsUser(adminEmail);
       const { error } = await client
         .from("companies")
-        .update({ enterprise_pricing_enabled: true })
+        .update({ volume_discounts_enabled: true })
         .eq("id", companyA.id);
       expect(error).toBeNull();
       const { data } = await adminClient
         .from("companies")
-        .select("enterprise_pricing_enabled")
+        .select("volume_discounts_enabled")
         .eq("id", companyA.id)
         .single();
-      expect(data?.enterprise_pricing_enabled).toBe(true);
+      expect(data?.volume_discounts_enabled).toBe(true);
     });
 
-    it("✗ a company_member (not admin) cannot toggle Enterprise pricing", async () => {
+    it("✗ a company_member (not admin) cannot toggle Volume discounts", async () => {
       const client = await clientAsUser(memberEmail);
       const { error, count } = await client
         .from("companies")
-        .update({ enterprise_pricing_enabled: false }, { count: "exact" })
+        .update({ volume_discounts_enabled: false }, { count: "exact" })
         .eq("id", companyA.id)
         .select("id");
       expect(error).toBeNull();
@@ -5405,16 +5405,16 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
       // Untouched by the rejected attempt -- still true from the test above.
       const { data } = await adminClient
         .from("companies")
-        .select("enterprise_pricing_enabled")
+        .select("volume_discounts_enabled")
         .eq("id", companyA.id)
         .single();
-      expect(data?.enterprise_pricing_enabled).toBe(true);
+      expect(data?.volume_discounts_enabled).toBe(true);
     });
   });
 
   describe("create_order() redemption: bundled cover auto-attach", () => {
-    it("✓ baseline regression: with Enterprise pricing OFF, redeeming a Laptop credit attaches no cover", async () => {
-      await adminClient.from("companies").update({ enterprise_pricing_enabled: false }).eq("id", companyB.id);
+    it("✓ baseline regression: with Volume discounts OFF, redeeming a Laptop credit attaches no cover", async () => {
+      await adminClient.from("companies").update({ volume_discounts_enabled: false }).eq("id", companyB.id);
       await adminClient.from("credit_ledger").insert({
         company_id: companyB.id,
         kit_type_id: "laptop",
@@ -5422,7 +5422,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
         direction: "credit",
         quantity: 1,
         balance_after: 1,
-        reason: "seed for baseline (no enterprise) redemption test",
+        reason: "seed for baseline (no volume discount) redemption test",
       });
 
       const { data: emp } = await adminClient
@@ -5450,7 +5450,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
       expect(order?.payment_status).toBe("paid");
     });
 
-    it("✓ with Enterprise pricing ON, redeeming a Laptop credit auto-attaches the £2,000 cover tier at zero extra charge", async () => {
+    it("✓ with Volume discounts ON, redeeming a Laptop credit auto-attaches the £2,000 cover tier at zero extra charge", async () => {
       // companyA was switched on in the RLS block above.
       await adminClient.from("credit_ledger").insert({
         company_id: companyA.id,
@@ -5459,7 +5459,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
         direction: "credit",
         quantity: 1,
         balance_after: (await balanceFor(companyA.id, "laptop")) + 1,
-        reason: "seed for enterprise redemption test",
+        reason: "seed for volume discount redemption test",
       });
 
       const client = await clientAsUser(adminEmail);
@@ -5482,7 +5482,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
       expect(order?.paid_with_credit).toBe(true);
     });
 
-    it("✗ even for an Enterprise company, explicitly passing p_cover_tier_id alongside p_pay_with_credit is still rejected", async () => {
+    it("✗ even for a volume-discount company, explicitly passing p_cover_tier_id alongside p_pay_with_credit is still rejected", async () => {
       await adminClient.from("credit_ledger").insert({
         company_id: companyA.id,
         kit_type_id: "laptop",
@@ -5508,7 +5508,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
       expect(balanceAfter).toBe(balanceBefore); // rejected call must not have debited anything
     });
 
-    it("✓ Enterprise pricing is scoped to Laptop only — redeeming a Phone credit gets no auto-attached cover even with the switch on", async () => {
+    it("✓ Volume discounts is scoped to Laptop only — redeeming a Phone credit gets no auto-attached cover even with the switch on", async () => {
       await adminClient.from("credit_ledger").insert({
         company_id: companyA.id,
         kit_type_id: "phone",
@@ -5539,7 +5539,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
   });
 
   describe("create_internal_order() redemption: same auto-attach rule, Retool path", () => {
-    it("✓ staff creating a credit-paid Laptop order for an Enterprise company also gets the bundled cover attached", async () => {
+    it("✓ staff creating a credit-paid Laptop order for a volume-discount company also gets the bundled cover attached", async () => {
       await adminClient.from("credit_ledger").insert({
         company_id: companyA.id,
         kit_type_id: "laptop",
@@ -5547,7 +5547,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
         direction: "credit",
         quantity: 1,
         balance_after: (await balanceFor(companyA.id, "laptop")) + 1,
-        reason: "seed for create_internal_order enterprise test",
+        reason: "seed for create_internal_order volume discount test",
       });
 
       const { data: orderId, error } = await adminClient.rpc("create_internal_order", {
@@ -5575,7 +5575,7 @@ describe("Enterprise pricing — tiered Laptop credit pricing and bundled Enhanc
 describe("create_credit_order_with_paid_cover() — kit paid by credit, Enhanced Cover paid separately by card (20260819)", () => {
   // Direct answer to a customer question: "why can't I add cover if I pay
   // with credits?" Design confirmed with the user: rejected making credits
-  // Enterprise-only and rejected bundling a fixed free cover tier into
+  // Volume-discount-only and rejected bundling a fixed free cover tier into
   // every credit — chosen instead was real purchasable cover on a
   // credit-paid order, charged separately by card. See
   // 20260819220000_cover_paid_separately_on_credit_orders.sql and
@@ -5715,7 +5715,7 @@ describe("create_credit_order_with_paid_cover() — kit paid by credit, Enhanced
     expect(order?.paid_with_credit).toBe(true);
     expect(order?.credit_transaction_id).not.toBeNull();
     expect(order?.cover_tier_id).toBe("up_to_1000");
-    expect(order?.cover_price_ex_vat_pence).toBe(1000); // the real cover_tiers price — NOT zeroed like the Enterprise-bundled path
+    expect(order?.cover_price_ex_vat_pence).toBe(1000); // the real cover_tiers price — NOT zeroed like the volume-discount-bundled path
     expect(order?.cover_paid_separately).toBe(true);
     expect(order?.invoice_id).not.toBeNull();
     expect(order?.source).toBe("customer");

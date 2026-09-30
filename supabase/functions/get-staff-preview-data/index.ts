@@ -202,11 +202,11 @@ async function handleRequest(req: Request): Promise<Response> {
 
   const companyId = tokenRow.company_id as string;
 
-  const [companyRes, ordersRes, employeesRes, invoicesRes, creditLedgerRes, kitTypesRes, enterpriseTiersRes, notifPrefRes] =
+  const [companyRes, ordersRes, employeesRes, invoicesRes, creditLedgerRes, kitTypesRes, volumeDiscountTiersRes, notifPrefRes] =
     await Promise.all([
       supabase
         .from("companies")
-        .select("id, name, domain, enterprise_pricing_enabled")
+        .select("id, name, domain, volume_discounts_enabled")
         .eq("id", companyId)
         .maybeSingle(),
       supabase
@@ -229,7 +229,7 @@ async function handleRequest(req: Request): Promise<Response> {
         .order("created_at", { ascending: false }),
       supabase.from("kit_types").select("id, label, price_ex_vat_pence").eq("active", true).eq("internal_only", false).order("label"),
       supabase
-        .from("enterprise_pricing_tiers")
+        .from("volume_discount_tiers")
         .select("min_quantity, price_ex_vat_pence")
         .eq("kit_type_id", "laptop")
         .eq("active", true)
@@ -249,7 +249,7 @@ async function handleRequest(req: Request): Promise<Response> {
     ["invoices", invoicesRes],
     ["credit_ledger", creditLedgerRes],
     ["kit_types", kitTypesRes],
-    ["enterprise_pricing_tiers", enterpriseTiersRes],
+    ["volume_discount_tiers", volumeDiscountTiersRes],
   ] as const) {
     if (res.error) {
       captureError(res.error, { function: "get-staff-preview-data", step: `fetch ${label}`, companyId });
@@ -312,7 +312,7 @@ async function handleRequest(req: Request): Promise<Response> {
     invoices: invoicesRes.data ?? [],
     credit_ledger: creditLedgerRes.data ?? [],
     kit_types: kitTypesRes.data ?? [],
-    enterprise_pricing_tiers: enterpriseTiersRes.data ?? [],
+    volume_discount_tiers: volumeDiscountTiersRes.data ?? [],
     checkin_reminders_enabled: notifPrefRes.data?.enabled ?? true,
     expires_at: tokenRow.expires_at,
   });

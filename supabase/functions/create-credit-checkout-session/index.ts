@@ -19,13 +19,13 @@
 // confirms payment. If this function crashes, times out, or the customer
 // just closes the tab, nothing in our database has changed.
 //
-// Enterprise pricing (added 20260819): when the buying company has
-// companies.enterprise_pricing_enabled=true and the kit type is Laptop,
-// the per-unit price comes from enterprise_pricing_tiers instead of the
+// Volume discounts (added 20260819): when the buying company has
+// companies.volume_discounts_enabled=true and the kit type is Laptop,
+// the per-unit price comes from volume_discount_tiers instead of the
 // flat kit_types.price_ex_vat_pence -- the highest min_quantity tier whose
 // threshold the requested quantity meets or exceeds wins, applied to every
 // unit in this one purchase (per-purchase tiering, not cumulative lifetime
-// volume -- see CLAUDE.md/the schema migration for why). Every Enterprise
+// volume -- see CLAUDE.md/the schema migration for why). Every volume-discount
 // tier bundles Enhanced Cover into the price already; nothing extra is
 // added to the Stripe line item for that -- see create_order/
 // create_internal_order for where the bundled cover is actually attached,
@@ -138,7 +138,7 @@ type CompanyRow = {
   name: string;
   billing_email: string | null;
   stripe_customer_id: string | null;
-  enterprise_pricing_enabled: boolean;
+  volume_discounts_enabled: boolean;
 };
 
 type KitTypeRow = {
@@ -149,7 +149,7 @@ type KitTypeRow = {
   active: boolean;
 };
 
-type EnterpriseTierRow = {
+type VolumeDiscountTierRow = {
   min_quantity: number;
   price_ex_vat_pence: number;
 };
@@ -216,7 +216,7 @@ async function handleRequest(req: Request): Promise<Response> {
 
   const { data: company, error: companyError } = await userClient
     .from("companies")
-    .select("id, name, billing_email, stripe_customer_id, enterprise_pricing_enabled")
+    .select("id, name, billing_email, stripe_customer_id, volume_discounts_enabled")
     .single();
 
   if (companyError || !company) {
@@ -253,15 +253,15 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Same per-unit price as self-serve checkout by default — no bulk discount
-  // (v1 scope decision, 20260812) — UNLESS this company has Enterprise
+  // (v1 scope decision, 20260812) — UNLESS this company has volume-discount
   // pricing on and is buying Laptop credits, in which case the per-unit
-  // price comes from enterprise_pricing_tiers instead (see header comment).
+  // price comes from volume_discount_tiers instead (see header comment).
   let unitPriceExVatPence = kitTypeRow.price_ex_vat_pence;
-  let enterpriseTierApplied: EnterpriseTierRow | null = null;
+  let volumeDiscountTierApplied: VolumeDiscountTierRow | null = null;
 
-  if (companyRow.enterprise_pricing_enabled && kitTypeId === "laptop") {
+  if (companyRow.volume_discounts_enabled && kitTypeId === "laptop") {
     const { data: tier, error: tierError } = await userClient
-      .from("enterprise_pricing_tiers")
+      .from("volume_discount_tiers")
       .select("min_quantity, price_ex_vat_pence")
       .eq("kit_type_id", kitTypeId)
       .eq("active", true)
@@ -271,16 +271,16 @@ async function handleRequest(req: Request): Promise<Response> {
       .maybeSingle();
 
     if (tierError) {
-      captureError(tierError, { function: "create-credit-checkout-session", step: "enterprise tier lookup" });
-      return new Response(JSON.stringify({ error: "Could not look up Enterprise pricing" }), {
+      captureError(tierError, { function: "create-credit-checkout-session", step: "volume discount tier lookup" });
+      return new Response(JSON.stringify({ error: "Could not look up volume-discount pricing" }), {
         status: 500,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
 
     if (tier) {
-      enterpriseTierApplied = tier as EnterpriseTierRow;
-      unitPriceExVatPence = enterpriseTierApplied.price_ex_vat_pence;
+      volumeDiscountTierApplied = tier as VolumeDiscountTierRow;
+      unitPriceExVatPence = volumeDiscountTierApplied.price_ex_vat_pence;
     }
   }
 
@@ -311,8 +311,8 @@ async function handleRequest(req: Request): Promise<Response> {
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     // Passing the existing customer means Stripe Checkout automatically
-    // offers a saved card (from create-card-setup-session) as a one-click
-    // option — no embedded Elements or off-session charging needed.
+    // offers a saved card as a one-click option — no embedded Elements or
+    // off-session charging needed.
     customer: stripeCustomerId,
     line_items: [
       {
@@ -320,7 +320,7 @@ async function handleRequest(req: Request): Promise<Response> {
           currency: "gbp",
           product_data: {
             name: `${quantity} × ${kitTypeRow.label} credit${quantity === 1 ? "" : "s"}${
-              enterpriseTierApplied ? " (Enterprise pricing, includes Enhanced Cover)" : ""
+              volumeDiscountTierApplied ? " (Volume discount pricing, includes Enhanced Cover)" : ""
             }`,
           },
           unit_amount: unitIncVatPence,
@@ -338,7 +338,7 @@ async function handleRequest(req: Request): Promise<Response> {
       subtotal_ex_vat_pence: String(subtotalExVatPence),
       vat_pence: String(vatPence),
       total_inc_vat_pence: String(totalIncVatPence),
-      enterprise_tier_min_quantity: enterpriseTierApplied ? String(enterpriseTierApplied.min_quantity) : "",
+      volume_discount_tier_min_quantity: volumeDiscountTierApplied ? String(volumeDiscountTierApplied.min_quantity) : "",
     },
   });
 
