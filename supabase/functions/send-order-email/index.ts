@@ -814,6 +814,18 @@ type CheckinSentEmployeeStatus = "notify_off" | "no_email";
 // flight -- device_reference (asset tag / serial, optional at order
 // creation) disambiguates when it's present, without changing anything for
 // the majority of orders that don't set it.
+// Royal Mail drop-off locator (added 20261014, direct user request: reminders
+// should tell the employee to drop the device at their nearest Royal Mail
+// drop-off point and link to the locator). The locator asks for a postcode
+// itself, so the link is deliberately generic -- nothing is prefilled.
+const ROYAL_MAIL_DROP_OFF_URL = "https://www.royalmail.com/find-locations?size=Medium";
+
+function findDropOffLink(): string {
+  return `<p style="margin:0 0 12px;"><a href="${ROYAL_MAIL_DROP_OFF_URL}" style="color:#2563eb;font-size:14px;text-decoration:none;font-weight:600;">Find your nearest drop-off point →</a></p>
+    <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0 0 12px;">Enter your postcode to find the closest one.</p>
+    <p style="font-size:14px;line-height:22px;color:#111827;font-weight:700;margin:0 0 12px;">The label shows when to post by.</p>`;
+}
+
 function deviceLabel(kitLabel: string, deviceReference: string | null): string {
   return deviceReference ? `${kitLabel} (${escapeHtml(deviceReference)})` : escapeHtml(kitLabel);
 }
@@ -882,6 +894,10 @@ function buildCheckinSentEmail(props: {
       <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
       <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Still outstanding</h1>
       ${bodyHtml}
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:12px 0 12px;">
+        All ${employeeDisplay} needs to do is pack the device and drop it off at their nearest Royal Mail drop-off point.
+      </p>
+      ${findDropOffLink()}
     `;
     return layout(`Still outstanding — ${props.reference}`, tier3Body);
   }
@@ -922,8 +938,12 @@ function buildCheckinSentEmail(props: {
 
     bodyHtml = `
       <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-        ${baseLine} ${followUp} We'll take it from there once it arrives — no need to let us know.
+        ${baseLine} ${followUp}
       </p>
+      <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
+        ${employeeDisplay} just needs to pack the device and drop it off at their nearest Royal Mail drop-off point — everything they need is already in the box. We'll take it from there once it arrives.
+      </p>
+      ${findDropOffLink()}
     `;
   }
 
@@ -934,7 +954,7 @@ function buildCheckinSentEmail(props: {
   `;
   const previewText = isCollectionOverdue
     ? `Collection check — ${props.reference}`
-    : `Reminder: please send your kit back — ${props.reference}`;
+    : `Reminder: please drop off the device — ${props.reference}`;
   return layout(previewText, body);
 }
 
@@ -1124,15 +1144,13 @@ function buildEmployeeCheckinSentEmail(props: {
         </p>
       `;
     } else {
-      previewText = "One last reminder — please send your old device back";
+      previewText = "One last reminder — please drop off your old device";
       body = `
         <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">One last reminder</h1>
         <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-          Hi ${escapeHtml(props.employeeName)}, we've reached out about this twice now and still haven't had your old device back from ${companyDisplay}. Could you get it sent by ${deadlineDisplay}?
+          Hi ${escapeHtml(props.employeeName)}, we've reached out about this twice now and still haven't had your old device back from ${companyDisplay}. Could you pack it and drop it off at your nearest Royal Mail drop-off point by ${deadlineDisplay}? Everything you need is already in the box.
         </p>
-        <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-          Everything you need is already in the box — pack it, attach the label, and either drop it off or scan the QR code for a home collection.
-        </p>
+        ${findDropOffLink()}
         <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
           If there's a reason this hasn't happened yet — device is lost, damaged, or something else — just reply and let us know, we'll sort it from there.
         </p>
@@ -1178,15 +1196,16 @@ function buildEmployeeCheckinSentEmail(props: {
     if (isFollowUp) {
       // Same genericization as the first-send branch below -- "posting"
       // assumed drop-off, which is no longer the only option.
-      previewText = "Still outstanding — please send your device back";
+      previewText = "Still outstanding — please drop off your old device";
       body = `
         <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Still waiting on this one</h1>
         <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
           Hi ${escapeHtml(props.employeeName)}, we sent a reminder about this already, but we still haven't had your old device back from ${companyDisplay}.
         </p>
         <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-          Everything you need to get it back to us is already in the box — no need to let us know once it's done.
+          Please pack it and drop it off at your nearest Royal Mail drop-off point — everything you need is already in the box.
         </p>
+        ${findDropOffLink()}
         <p style="font-size:13px;line-height:20px;color:#6b7280;margin:0;">
           Getting old company devices back promptly matters — it keeps them secure and properly accounted for, and closes this out for you.
         </p>
@@ -1201,13 +1220,13 @@ function buildEmployeeCheckinSentEmail(props: {
       // reminder can no longer assume either. "Everything you need is
       // already in the box" covers both the prepaid label (drop-off) and
       // the QR code (home collection) without committing to one.
-      previewText = "Just a reminder — please send your device back";
+      previewText = "Reminder: please drop off your old device";
       body = `
         <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Just a reminder</h1>
         <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">
-          Hi ${escapeHtml(props.employeeName)}, when you get a chance, please get your old device back to us —
-          everything you need is already in the box, whichever option's easiest for you. No need to let anyone know once it's done.
+          Hi ${escapeHtml(props.employeeName)}, please pack your old device and drop it off at your nearest Royal Mail drop-off point. Everything you need is already in the box.
         </p>
+        ${findDropOffLink()}
       `;
     }
   }
@@ -1284,14 +1303,14 @@ async function sendEmployeeCopy(props: {
       : tier === 3
         ? props.returnMethod === "collection"
           ? "One last follow-up on your collection"
-          : "One last reminder — please send your old device back"
+          : "One last reminder — please drop off your old device"
         : props.returnMethod === "collection"
           ? tier === 2
             ? "Still following up on your collection"
             : "We're following up on your collection"
           : tier === 2
-            ? "Still outstanding — please send your device back"
-            : "Just a reminder — please send your device back";
+            ? "Still outstanding — please drop off your old device"
+            : "Reminder: please drop off your old device";
 
   // One-shot for dispatched, scoped to this order specifically (not
   // bundle-aware like the customer confirmation -- an employee only cares
@@ -1790,7 +1809,7 @@ async function handleRequest(req: Request): Promise<Response> {
         ? `Still outstanding — ${resolvedEmployee.name ?? "the recipient"}'s device`
         : o.return_method === "collection"
           ? `Collection check — ${o.reference}`
-          : `Reminder: please send your kit back — ${o.reference}`;
+          : `Reminder: please drop off the device — ${o.reference}`;
     // Reaching this point already proves !employeeEligible, so
     // employeeStatus can only ever be notify_off or no_email here -- see
     // CheckinSentEmployeeStatus's own comment for why "notified" was
