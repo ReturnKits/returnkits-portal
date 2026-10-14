@@ -20,6 +20,9 @@ supabase/.temp/
 .DS_Store
 Thumbs.db
 
+# Database backups — never commit
+backups/
+
 # Logs
 *.log
 npm-debug.log*

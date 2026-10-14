@@ -4022,6 +4022,119 @@ describe("orders_needing_checkin() — leaver_last_day gate + collection_date el
   });
 });
 
+// ---------------------------------------------------------------------------
+// orders_needing_checkin() — 3-working-day start + skip once return leg starts
+// (20261014: migrations 20261014100000 and 20261014110000)
+// ---------------------------------------------------------------------------
+describe("orders_needing_checkin() — 3-working-day start and return-leg-started exclusion (20261014)", () => {
+  let company: { id: string };
+  let order: { id: string };
+  const email = uniqueEmail("checkin-3day");
+  const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
+
+  function eligible(data: unknown, orderId: string): string | undefined {
+    return (data as { order_id: string; checkin_type: string }[]).find((r) => r.order_id === orderId)?.checkin_type;
+  }
+
+  async function setDispatched(at: string, extraLog: unknown[] = []) {
+    await adminClient
+      .from("orders")
+      .update({
+        fulfilment_status: "dispatched",
+        leaver_last_day: null,
+        fulfilment_log: [{ at, action: "dispatched", detail: {}, actor_id: null }, ...extraLog],
+      })
+      .eq("id", order.id);
+  }
+
+  beforeAll(async () => {
+    company = await createCompany("Checkin 3-Day Test Co");
+    const user = await createAuthUser(email);
+    await createProfile(user.id, company.id, email, "company_admin");
+
+    const { data: employee, error: empError } = await adminClient
+      .from("employees")
+      .insert({ company_id: company.id, full_name: "3-Day Test Employee", email: "checkin-3day-emp@example.com" })
+      .select()
+      .single();
+    if (empError) throw empError;
+
+    const { data: addr, error: addrError } = await adminClient
+      .from("addresses")
+      .insert({ company_id: company.id, label: "HQ", address_line1: "1 Test Street", city: "London", postcode: "E1 6AN" })
+      .select()
+      .single();
+    if (addrError) throw addrError;
+
+    const client = await clientAsUser(email);
+    const { data: orderId, error: orderError } = await client.rpc("create_order", {
+      p_kit_type_id: "laptop",
+      p_service_type: "return",
+      p_employee_id: employee!.id,
+      p_return_address_id: (addr as { id: string }).id,
+      p_return_method: "drop_off",
+    });
+    if (orderError) throw orderError;
+    order = { id: orderId as string };
+  });
+
+  afterAll(async () => {
+    await adminClient.from("order_tracking_numbers").delete().eq("order_id", order.id);
+    await adminClient.from("orders").delete().eq("id", order.id);
+    await deleteAuthUserByEmail(email);
+    await adminClient.from("companies").delete().eq("id", company.id);
+  });
+
+  it("✗ dispatched yesterday is NOT due (3 working days have not passed)", async () => {
+    await setDispatched(daysAgo(1));
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, order.id)).toBeUndefined();
+  });
+
+  it("✓ dispatched 10 days ago IS due", async () => {
+    await setDispatched(daysAgo(10));
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, order.id)).toBe("checkin_sent");
+  });
+
+  it("✗ an otherwise-due order is excluded once fulfilment_log records any return-leg event", async () => {
+    await setDispatched(daysAgo(10), [
+      { at: daysAgo(1), action: "in_transit", detail: { leg: "return" }, actor_id: null },
+    ]);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, order.id)).toBeUndefined();
+  });
+
+  it("✓ an outbound-leg log entry does NOT exclude the order", async () => {
+    await setDispatched(daysAgo(10), [
+      { at: daysAgo(5), action: "in_transit", detail: { leg: "outbound" }, actor_id: null },
+    ]);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, order.id)).toBe("checkin_sent");
+  });
+
+  it("✗ an extra return parcel that has left awaiting_scan excludes the order", async () => {
+    await setDispatched(daysAgo(10));
+    const { error } = await adminClient.from("order_tracking_numbers").insert({
+      order_id: order.id,
+      company_id: company.id,
+      leg: "return",
+      courier: "Royal Mail",
+      tracking_number: "CHECKIN3DAYTEST001",
+      status: "in_transit",
+    });
+    if (error) throw error;
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, order.id)).toBeUndefined();
+  });
+
+  it("✓ an extra return parcel still in awaiting_scan does NOT exclude the order", async () => {
+    await adminClient.from("order_tracking_numbers").update({ status: "awaiting_scan" }).eq("order_id", order.id);
+    const { data } = await adminClient.rpc("orders_needing_checkin");
+    expect(eligible(data, order.id)).toBe("checkin_sent");
+  });
+});
+
 // The blocks below close gaps found in a Launch Gate review: real,
 // tenant-scoped RLS policies existed for these tables from Phase 2/3
 // onward, but no test ever exercised either direction on them -- they were
