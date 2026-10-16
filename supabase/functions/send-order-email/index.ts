@@ -968,10 +968,11 @@ function buildCheckinSentEmail(props: {
 // employee copy: the leaver has already done their part by the time this
 // fires and has no portal access to check anything further, so there's
 // nothing for them to act on -- see the design discussion in CLAUDE.md.
-// estimatedArrivalDate is resolved by the caller (either Sendcloud's own
-// expected_delivery_date from the tracking payload, confirmed present in a
-// real response 20260814, or a working-day fallback) and passed straight
-// through here rather than recomputed -- this function only renders it.
+// Changed 20261016 (direct user request): no estimated arrival date (the
+// carrier estimate was wrong on a real customer email) and no "collected"
+// wording (returns go in at a Royal Mail drop-off point, not a collection).
+// The estimatedArrivalDate prop/caller param was removed with it; callers
+// that still send it in the request body are simply ignored.
 function buildReturnInTransitEmail(props: {
   companyName: string;
   reference: string;
@@ -979,7 +980,6 @@ function buildReturnInTransitEmail(props: {
   courier: string;
   trackingNumber: string;
   trackingUrl: string | null;
-  estimatedArrivalDate: string | null;
 }): string {
   const trackingBlock = `
     ${field("Courier", props.courier)}
@@ -987,21 +987,12 @@ function buildReturnInTransitEmail(props: {
     ${props.trackingUrl ? trackButton(props.trackingUrl) : ""}
   `;
 
-  // "Around" + explicit caveat rather than a bare date -- a real Sendcloud
-  // expected_delivery_date checked 20260814 was a day early against the
-  // parcel's actual delivery, so this deliberately reads as an estimate,
-  // never a promise.
-  const etaLine = props.estimatedArrivalDate
-    ? `<p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">Estimated arrival: around ${escapeHtml(formatDate(props.estimatedArrivalDate))}. Courier estimates can shift by a day or so.</p>`
-    : "";
-
   const body = `
     <p style="font-size:12px;color:#9ca3af;margin:0 0 4px;">Order ${escapeHtml(props.reference)}</p>
     <h1 style="font-size:22px;font-weight:700;color:#111827;margin:0 0 16px;">Your return is on its way back</h1>
-    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 12px;">${escapeHtml(props.kitLabel)} for ${escapeHtml(props.companyName)} has been collected and is heading back to us.</p>
-    ${etaLine}
+    <p style="font-size:14px;line-height:22px;color:#374151;margin:0 0 20px;">The device is on its way back.</p>
     ${trackingBlock}
-    <p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">We'll let you know once it's arrived — nothing further to do on your end.</p>
+    <p style="font-size:13px;line-height:20px;color:#6b7280;margin:20px 0 0;">Nothing further to do on your end.</p>
   `;
 
   return layout(`Return in progress — ${props.reference}`, body);
@@ -1828,24 +1819,7 @@ async function handleRequest(req: Request): Promise<Response> {
       tier: customerTier,
     });
   } else {
-    // return_in_transit: prefer the caller's resolved date (sourced from
-    // Sendcloud's expected_delivery_date on the tracking payload), fall
-    // back to a working-day estimate off today's date when the caller
-    // didn't have one to pass through.
-    let estimatedArrivalDate = callerEstimatedArrivalDate;
-    if (!estimatedArrivalDate) {
-      try {
-        const { data: fallbackDate } = await supabase.rpc("add_working_days", {
-          p_start: new Date().toISOString().slice(0, 10),
-          p_n: RETURN_IN_TRANSIT_FALLBACK_WORKING_DAYS,
-        });
-        estimatedArrivalDate = typeof fallbackDate === "string" ? fallbackDate : null;
-      } catch (err) {
-        captureError(err, { function: "send-order-email", orderId: o.id, step: "add_working_days fallback" });
-        estimatedArrivalDate = null;
-      }
-    }
-
+    // return_in_transit: no estimated arrival date (removed 20261016).
     subject = `Return in progress — ${o.reference}`;
     html = buildReturnInTransitEmail({
       companyName: o.company.name,
@@ -1854,7 +1828,6 @@ async function handleRequest(req: Request): Promise<Response> {
       courier: o.return_courier ?? "Courier",
       trackingNumber: o.return_tracking_number ?? "—",
       trackingUrl: o.return_tracking_url,
-      estimatedArrivalDate,
     });
   }
 
