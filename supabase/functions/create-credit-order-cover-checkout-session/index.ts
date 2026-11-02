@@ -323,11 +323,15 @@ async function handleRequest(req: Request): Promise<Response> {
   }
 
   // Courtesy balance check — see header comment. The RPC re-checks for real.
+  // Purchased credits only (promotion_id is null); the free first-laptop-return
+  // promo credit counts separately, and only for an order it can actually pay
+  // for (laptop return) — the RPC also checks both addresses are in GB.
   const { data: ledgerRows, error: ledgerError } = await userClient
     .from("credit_ledger")
     .select("direction, quantity")
     .eq("company_id", companyRow.id)
-    .eq("kit_type_id", kitTypeId);
+    .eq("kit_type_id", kitTypeId)
+    .is("promotion_id", null);
 
   if (ledgerError) {
     captureError(ledgerError, { function: "create-credit-order-cover-checkout-session", step: "balance check" });
@@ -336,11 +340,22 @@ async function handleRequest(req: Request): Promise<Response> {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
-  const balance = (ledgerRows ?? []).reduce(
+  const purchasedBalance = (ledgerRows ?? []).reduce(
     (sum, row) => sum + (row.direction === "credit" ? row.quantity : -row.quantity),
     0,
   );
-  if (balance < 1) {
+
+  let promoUsable = false;
+  if (purchasedBalance < 1 && kitTypeId === "laptop" && serviceType === "return") {
+    const { data: grant } = await userClient
+      .from("promotion_grants")
+      .select("status, expires_at")
+      .eq("company_id", companyRow.id)
+      .maybeSingle();
+    promoUsable = !!grant && grant.status === "issued" && new Date(grant.expires_at).getTime() > Date.now();
+  }
+
+  if (purchasedBalance < 1 && !promoUsable) {
     return new Response(JSON.stringify({ error: `Insufficient ${kitTypeId} credit balance` }), {
       status: 400,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
